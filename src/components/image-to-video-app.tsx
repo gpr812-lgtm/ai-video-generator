@@ -56,8 +56,10 @@ interface VideoSettings {
   fps: number
   quality: Quality
   withAudio: boolean
-  voiceoverText: string // Russian text for TTS voiceover
+  voiceoverText: string // Russian text for TTS voiceover (single voice mode)
   voiceId: string // voice selection for TTS
+  dialogueMode: boolean // multi-voice dialogue mode
+  dialogue: DialogueLine[] // multi-voice dialogue lines
   filter: string // video filter id
   bgMusic: string // background music id
 }
@@ -130,6 +132,12 @@ const VOICES = [
   { id: 'male-fast', name: '👨 Мужской (энергичный)', lang: 'ru-RU', pitch: 0.85, rate: 1.1 },
   { id: 'neutral', name: '-neutral Нейтральный', lang: 'ru-RU', pitch: 1.0, rate: 1.0 },
 ]
+
+// Multi-voice dialogue: each line has its own voice
+interface DialogueLine {
+  text: string
+  voiceId: string
+}
 
 const MAX_FILE_SIZE = 12 * 1024 * 1024 // 12 MB (raw file)
 const RESIZE_MAX_DIM = 512 // resize longest side to this before uploading (smaller = faster upload)
@@ -276,6 +284,11 @@ export default function ImageToVideoApp() {
     withAudio: false,
     voiceoverText: '',
     voiceId: 'female-default',
+    dialogueMode: false,
+    dialogue: [
+      { text: 'Привет! Как дела?', voiceId: 'female-default' },
+      { text: 'Отлично! А у тебя?', voiceId: 'male-default' },
+    ],
     filter: 'none',
     bgMusic: 'none',
   })
@@ -1031,18 +1044,36 @@ export default function ImageToVideoApp() {
     localStorage.setItem('i2v_stats', JSON.stringify(newStats))
 
     // Play Russian voiceover if enabled
-    if (settings.withAudio && settings.voiceoverText.trim()) {
+    if (settings.withAudio) {
       try {
-        const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
-        const utterance = new SpeechSynthesisUtterance(settings.voiceoverText)
-        utterance.lang = voice.lang
-        utterance.pitch = voice.pitch
-        utterance.rate = voice.rate
-        const voices = window.speechSynthesis.getVoices()
-        const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
-        if (ruVoice) utterance.voice = ruVoice
-        window.speechSynthesis.speak(utterance)
-        toast.info(`🔊 Озвучка: ${voice.name}`)
+        window.speechSynthesis.cancel()
+        if (settings.dialogueMode) {
+          // Multi-voice dialogue: each line with its own voice, sequentially
+          settings.dialogue.forEach((line) => {
+            if (!line.text.trim()) return
+            const voice = VOICES.find((v) => v.id === line.voiceId) || VOICES[0]
+            const u = new SpeechSynthesisUtterance(line.text)
+            u.lang = voice.lang
+            u.pitch = voice.pitch
+            u.rate = voice.rate
+            const voices = window.speechSynthesis.getVoices()
+            const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+            if (ruVoice) u.voice = ruVoice
+            window.speechSynthesis.speak(u)
+          })
+          toast.info('🔊 Многоголосная озвучка воспроизводится...')
+        } else if (settings.voiceoverText.trim()) {
+          const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
+          const utterance = new SpeechSynthesisUtterance(settings.voiceoverText)
+          utterance.lang = voice.lang
+          utterance.pitch = voice.pitch
+          utterance.rate = voice.rate
+          const voices = window.speechSynthesis.getVoices()
+          const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+          if (ruVoice) utterance.voice = ruVoice
+          window.speechSynthesis.speak(utterance)
+          toast.info(`🔊 Озвучка: ${voice.name}`)
+        }
       } catch {
         toast.error('Не удалось воспроизвести озвучку')
       }
@@ -1497,11 +1528,14 @@ export default function ImageToVideoApp() {
                         <SelectItem value="20">20 секунд</SelectItem>
                         <SelectItem value="30">30 секунд</SelectItem>
                         <SelectItem value="45">45 секунд</SelectItem>
-                        <SelectItem value="60">60 секунд</SelectItem>
+                        <SelectItem value="60">1 минута</SelectItem>
+                        <SelectItem value="120">2 минуты</SelectItem>
+                        <SelectItem value="180">3 минуты</SelectItem>
+                        <SelectItem value="300">5 минут</SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="mt-1 text-[10px] text-white/30">
-                      ZAI макс. 10с • Colab ~6с • ffmpeg любое
+                      Видео {'>'}10с создаются по частям (5с сегменты) и склеиваются
                     </p>
                   </div>
 
@@ -1574,56 +1608,167 @@ export default function ImageToVideoApp() {
                 {/* Russian voiceover text input */}
                 {settings.withAudio && (
                   <div className="mt-3 rounded-xl border border-fuchsia-400/20 bg-fuchsia-500/5 p-3">
-                    <Label className="mb-2 block text-xs text-fuchsia-200">
-                      🎙️ Голос озвучки:
-                    </Label>
-                    <Select
-                      value={settings.voiceId}
-                      onValueChange={(v) => setSettings((s) => ({ ...s, voiceId: v }))}
-                    >
-                      <SelectTrigger className="mb-3 border-white/10 bg-white/[0.04] text-white">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {VOICES.map((v) => (
-                          <SelectItem key={v.id} value={v.id}>
-                            {v.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <Label className="mb-2 block text-xs text-fuchsia-200">
-                      Текст для озвучивания (русский):
-                    </Label>
-                    <Textarea
-                      value={settings.voiceoverText}
-                      onChange={(e) =>
-                        setSettings((s) => ({ ...s, voiceoverText: e.target.value }))
-                      }
-                      placeholder="Например: Привет! Это видео создано нейросетью..."
-                      rows={2}
-                      className="resize-none border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
-                    />
-                    <div className="mt-2 flex gap-2">
+                    {/* Mode toggle: single voice vs dialogue */}
+                    <div className="mb-3 flex gap-2">
+                      <Button
+                        size="sm"
+                        variant={!settings.dialogueMode ? 'default' : 'outline'}
+                        onClick={() => setSettings((s) => ({ ...s, dialogueMode: false }))}
+                        className={!settings.dialogueMode ? 'bg-fuchsia-500 text-white' : 'border-white/15 text-white/60'}
+                      >
+                        🎙️ Один голос
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={settings.dialogueMode ? 'default' : 'outline'}
+                        onClick={() => setSettings((s) => ({ ...s, dialogueMode: true }))}
+                        className={settings.dialogueMode ? 'bg-fuchsia-500 text-white' : 'border-white/15 text-white/60'}
+                      >
+                        🗣️ Диалог (многоголосная)
+                      </Button>
+                    </div>
+
+                    {/* Single voice mode */}
+                    {!settings.dialogueMode && (
+                      <>
+                        <Label className="mb-2 block text-xs text-fuchsia-200">
+                          Голос озвучки:
+                        </Label>
+                        <Select
+                          value={settings.voiceId}
+                          onValueChange={(v) => setSettings((s) => ({ ...s, voiceId: v }))}
+                        >
+                          <SelectTrigger className="mb-3 border-white/10 bg-white/[0.04] text-white">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {VOICES.map((v) => (
+                              <SelectItem key={v.id} value={v.id}>
+                                {v.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Label className="mb-2 block text-xs text-fuchsia-200">
+                          Текст для озвучивания (русский):
+                        </Label>
+                        <Textarea
+                          value={settings.voiceoverText}
+                          onChange={(e) =>
+                            setSettings((s) => ({ ...s, voiceoverText: e.target.value }))
+                          }
+                          placeholder="Например: Привет! Это видео создано нейросетью..."
+                          rows={2}
+                          className="resize-none border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
+                        />
+                      </>
+                    )}
+
+                    {/* Dialogue mode */}
+                    {settings.dialogueMode && (
+                      <>
+                        <Label className="mb-2 block text-xs text-fuchsia-200">
+                          🗣️ Реплики диалога (каждая — свой голос):
+                        </Label>
+                        <div className="space-y-2">
+                          {settings.dialogue.map((line, idx) => (
+                            <div key={idx} className="flex gap-2">
+                              <Select
+                                value={line.voiceId}
+                                onValueChange={(v) => {
+                                  const newDialogue = [...settings.dialogue]
+                                  newDialogue[idx] = { ...line, voiceId: v }
+                                  setSettings((s) => ({ ...s, dialogue: newDialogue }))
+                                }}
+                              >
+                                <SelectTrigger className="w-40 shrink-0 border-white/10 bg-white/[0.04] text-xs text-white">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {VOICES.map((v) => (
+                                    <SelectItem key={v.id} value={v.id}>
+                                      {v.name}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <Input
+                                value={line.text}
+                                onChange={(e) => {
+                                  const newDialogue = [...settings.dialogue]
+                                  newDialogue[idx] = { ...line, text: e.target.value }
+                                  setSettings((s) => ({ ...s, dialogue: newDialogue }))
+                                }}
+                                placeholder="Текст реплики..."
+                                className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                              />
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => {
+                                  const newDialogue = settings.dialogue.filter((_, i) => i !== idx)
+                                  setSettings((s) => ({ ...s, dialogue: newDialogue }))
+                                }}
+                                className="shrink-0 text-white/40 hover:text-red-400"
+                              >
+                                ✕
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setSettings((s) => ({
+                              ...s,
+                              dialogue: [...s.dialogue, { text: '', voiceId: 'male-default' }],
+                            }))
+                          }}
+                          className="mt-2 border-fuchsia-400/30 bg-fuchsia-500/10 text-fuchsia-200"
+                        >
+                          + Добавить реплику
+                        </Button>
+                      </>
+                    )}
+
+                    {/* Preview button */}
+                    <div className="mt-3 flex gap-2">
                       <Button
                         size="sm"
                         variant="outline"
                         onClick={() => {
-                          const voice = VOICES.find((v) => v.id === settings.voiceId)
-                          if (!voice || !settings.voiceoverText.trim()) {
-                            toast.error('Введите текст для озвучки')
-                            return
-                          }
                           try {
-                            const u = new SpeechSynthesisUtterance(settings.voiceoverText)
-                            u.lang = voice.lang
-                            u.pitch = voice.pitch
-                            u.rate = voice.rate
-                            const voices = window.speechSynthesis.getVoices()
-                            const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
-                            if (ruVoice) u.voice = ruVoice
                             window.speechSynthesis.cancel()
-                            window.speechSynthesis.speak(u)
+                            if (settings.dialogueMode) {
+                              // Play dialogue: each line with its own voice, sequentially
+                              settings.dialogue.forEach((line) => {
+                                if (!line.text.trim()) return
+                                const voice = VOICES.find((v) => v.id === line.voiceId) || VOICES[0]
+                                const u = new SpeechSynthesisUtterance(line.text)
+                                u.lang = voice.lang
+                                u.pitch = voice.pitch
+                                u.rate = voice.rate
+                                const voices = window.speechSynthesis.getVoices()
+                                const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+                                if (ruVoice) u.voice = ruVoice
+                                window.speechSynthesis.speak(u)
+                              })
+                            } else {
+                              const voice = VOICES.find((v) => v.id === settings.voiceId)
+                              if (!voice || !settings.voiceoverText.trim()) {
+                                toast.error('Введите текст для озвучки')
+                                return
+                              }
+                              const u = new SpeechSynthesisUtterance(settings.voiceoverText)
+                              u.lang = voice.lang
+                              u.pitch = voice.pitch
+                              u.rate = voice.rate
+                              const voices = window.speechSynthesis.getVoices()
+                              const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+                              if (ruVoice) u.voice = ruVoice
+                              window.speechSynthesis.speak(u)
+                            }
                           } catch {
                             toast.error('Не удалось воспроизвести')
                           }
@@ -1634,7 +1779,9 @@ export default function ImageToVideoApp() {
                       </Button>
                     </div>
                     <p className="mt-2 text-[11px] text-white/40">
-                      Озвучка воспроизводится через браузерное TTS (бесплатно)
+                      {settings.dialogueMode
+                        ? 'Каждая реплика озвучивается выбранным голосом по очереди'
+                        : 'Озвучка воспроизводится через браузерное TTS (бесплатно)'}
                     </p>
                   </div>
                 )}
