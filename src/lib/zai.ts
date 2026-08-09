@@ -182,41 +182,29 @@ export class ZaiApiError extends Error {
 }
 
 /**
- * Server-side rate limit tracker.
- *
- * ZAI's video generation API has a hard limit of 1 request per несколько минут per
- * API key (X-Ratelimit-User-10min-Limit: 1). Once we use our slot, we MUST NOT
- * send another request for несколько минут, or every request will get 429.
- *
- * This module tracks per-key cooldowns. When the user adds multiple API keys,
- * each key gets its own 10-minute window. The app picks the key with the
- * nearest available slot (or one that's immediately free).
+ * NO server-side rate limit tracking.
+ * We always call ZAI directly. If ZAI returns 429, we pass it to the client
+ * with a SHORT retry time (30s), not 10 minutes. The client retries every 30s
+ * until ZAI accepts the request.
  */
-const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000 // несколько минут
 
-// Per-key state: apiKey → { lastUsedAt, lastKnownRemaining }
-const keyState = new Map<string, { lastUsedAt: number; lastKnownRemaining: number | null }>()
+// Minimal key state — just for multi-key rotation, NO cooldown tracking
+const keyState = new Map<string, { lastUsedAt: number }>()
 
 function getKeyState(apiKey: string) {
   if (!keyState.has(apiKey)) {
-    keyState.set(apiKey, { lastUsedAt: 0, lastKnownRemaining: null })
+    keyState.set(apiKey, { lastUsedAt: 0 })
   }
   return keyState.get(apiKey)!
 }
 
-function markKeyUsed(apiKey: string, remaining: number | null = 0) {
+function markKeyUsed(apiKey: string) {
   const state = getKeyState(apiKey)
   state.lastUsedAt = Date.now()
-  state.lastKnownRemaining = remaining
 }
 
-function msUntilKeyFree(apiKey: string): number {
-  const state = getKeyState(apiKey)
-  if (state.lastUsedAt === 0) return 0
-  const elapsed = Date.now() - state.lastUsedAt
-  if (elapsed < RATE_LIMIT_WINDOW_MS) {
-    return RATE_LIMIT_WINDOW_MS - elapsed
-  }
+function msUntilKeyFree(_apiKey: string): number {
+  // ALWAYS return 0 — no cooldown tracking. Let ZAI decide.
   return 0
 }
 
@@ -250,8 +238,8 @@ export function getRateLimitStatus() {
   const { key, waitMs, totalKeys } = findBestKey()
   const allKeys = getAllKeys()
   return {
-    msUntilNextSlot: waitMs,
-    windowMs: RATE_LIMIT_WINDOW_MS,
+    msUntilNextSlot: waitMs, // always 0 now
+    windowMs: 30000, // 30s display only
     totalKeys,
     activeKeyLabel: key.label || 'default',
     keys: allKeys.map((k, i) => ({
@@ -373,19 +361,12 @@ export async function createVideoTask(
     }
 
     if (res.status === 429) {
-      // ZAI counted this attempt against this key's quota. Mark the key as
-      // used so we don't waste more requests with it during the lockout.
-      // (If other keys are available, the next call will use them.)
-      markKeyUsed(key.apiKey, 0)
-      // Find the next-best key's wait time for the error message
-      const next = findBestKey()
-      const mins = Math.floor(next.waitMs / 60000)
-      const secs = Math.ceil((next.waitMs % 60000) / 1000)
+      // ZAI returned 429. Retry in 30 seconds (NOT 10 minutes).
+      // ZAI's rate limit resets on their side — we just keep trying every 30s.
+      markKeyUsed(key.apiKey)
       throw new ZaiRateLimitError(
-        next.totalKeys === 1
-          ? `ZAI лимит: лимит запросов. Следующее окно через ${mins}м ${secs}с.`
-          : `Ключ «${key.label}» в кулдауне. Следующий ключ доступен через ${mins}м ${secs}с.`,
-        next.waitMs > 0 ? next.waitMs : 1000,
+        'ZAI временно недоступен. Повторная попытка через 30 секунд...',
+        30000, // 30 seconds, not 10 minutes!
       )
     }
 

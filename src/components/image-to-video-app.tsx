@@ -943,11 +943,11 @@ export default function ImageToVideoApp() {
       })
 
       if (res.status === 429 && data?.retryable) {
-        // Rate limited — show countdown and retry
-        const waitSec = Math.max(30, Math.round((data.retryAfterMs || 30000) / 1000))
+        // ZAI returned 429 — retry in 30 seconds (NOT 10 minutes!)
+        const waitSec = 30
         setStage('rate_limited')
         setRateLimitWait(waitSec)
-        toast.error(`ZAI лимит. Повтор через ${waitSec}с…`)
+        toast.info(`ZAI занят. Повтор через 30с…`)
         for (let s = waitSec; s > 0; s--) {
           if (cancelRef.current) break
           setRateLimitWait(s)
@@ -2049,7 +2049,7 @@ export default function ImageToVideoApp() {
                           …
                         </p>
                         <p className="mt-2 text-xs text-white/40">
-                          Лимит ZAI: окно откроется. Окно откроется
+                          ZAI занят. Повтор через
                           автоматически — оставьте вкладку открытой.
                         </p>
                       </div>
