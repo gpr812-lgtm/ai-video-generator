@@ -56,6 +56,7 @@ interface VideoSettings {
   fps: number
   quality: Quality
   withAudio: boolean
+  voiceoverText: string // Russian text for TTS voiceover
 }
 
 interface HistoryItem {
@@ -235,6 +236,7 @@ export default function ImageToVideoApp() {
     fps: 30,
     quality: 'speed',
     withAudio: false,
+    voiceoverText: '',
   })
 
   const [stage, setStage] = useState<Stage>('idle')
@@ -911,6 +913,23 @@ export default function ImageToVideoApp() {
     setStage('success')
     toast.success('Видео готово! (ZAI cogvideox-3)')
 
+    // Play Russian voiceover if enabled
+    if (settings.withAudio && settings.voiceoverText.trim()) {
+      try {
+        const utterance = new SpeechSynthesisUtterance(settings.voiceoverText)
+        utterance.lang = 'ru-RU'
+        utterance.rate = 0.95
+        // Try to find a Russian voice
+        const voices = window.speechSynthesis.getVoices()
+        const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+        if (ruVoice) utterance.voice = ruVoice
+        window.speechSynthesis.speak(utterance)
+        toast.info('🔊 Озвучка воспроизводится...')
+      } catch {
+        toast.error('Не удалось воспроизвести озвучку')
+      }
+    }
+
     // Save history
     try {
       const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
@@ -944,6 +963,7 @@ export default function ImageToVideoApp() {
       fps: 30,
       quality: 'speed',
       withAudio: false,
+      voiceoverText: '',
     })
   }, [clearImage])
 
@@ -1276,7 +1296,7 @@ export default function ImageToVideoApp() {
                   }
                   placeholder="Например: камера медленно приближается, лёгкий ветер шевелит листву…"
                   rows={3}
-                  className="resize-none border-white/10 bg-white/[0.04] text-sm placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
+                  className="resize-none border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
                 />
                 <div className="mt-3 flex flex-wrap gap-2">
                   {PROMPT_IDEAS.map((idea) => (
@@ -1393,10 +1413,10 @@ export default function ImageToVideoApp() {
                     )}
                     <div>
                       <div className="text-sm font-medium text-white/80">
-                        AI-озвучка
+                        AI-озвучка (русский)
                       </div>
                       <div className="text-xs text-white/45">
-                        Сгенерировать звуковое сопровождение
+                        Озвучить видео на русском языке
                       </div>
                     </div>
                   </div>
@@ -1407,6 +1427,27 @@ export default function ImageToVideoApp() {
                     }
                   />
                 </div>
+
+                {/* Russian voiceover text input */}
+                {settings.withAudio && (
+                  <div className="mt-3 rounded-xl border border-fuchsia-400/20 bg-fuchsia-500/5 p-3">
+                    <Label className="mb-2 block text-xs text-fuchsia-200">
+                      Текст для озвучивания (русский):
+                    </Label>
+                    <Textarea
+                      value={settings.voiceoverText}
+                      onChange={(e) =>
+                        setSettings((s) => ({ ...s, voiceoverText: e.target.value }))
+                      }
+                      placeholder="Например: Привет! Это видео создано нейросетью..."
+                      rows={2}
+                      className="resize-none border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
+                    />
+                    <p className="mt-1 text-[11px] text-white/40">
+                      Озвучка добавится к видео через браузерное TTS (бесплатно, без API)
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Generate button */}
