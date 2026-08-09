@@ -57,6 +57,7 @@ interface VideoSettings {
   quality: Quality
   withAudio: boolean
   voiceoverText: string // Russian text for TTS voiceover
+  voiceId: string // voice selection for TTS
   filter: string // video filter id
   bgMusic: string // background music id
 }
@@ -118,6 +119,16 @@ const BG_MUSIC = [
   { id: 'ambient', name: 'Амбиент (спокойно)' },
   { id: 'upbeat', name: 'Энергично' },
   { id: 'cinematic', name: 'Кинематографично' },
+]
+
+const VOICES = [
+  { id: 'female-default', name: '👩 Женский (по умолчанию)', lang: 'ru-RU', pitch: 1.0, rate: 0.95 },
+  { id: 'female-soft', name: '👩 Женский (мягкий)', lang: 'ru-RU', pitch: 1.1, rate: 0.85 },
+  { id: 'female-deep', name: '👩 Женский (глубокий)', lang: 'ru-RU', pitch: 0.9, rate: 0.9 },
+  { id: 'male-default', name: '👨 Мужской (по умолчанию)', lang: 'ru-RU', pitch: 0.8, rate: 0.95 },
+  { id: 'male-deep', name: '👨 Мужской (бархатный)', lang: 'ru-RU', pitch: 0.7, rate: 0.85 },
+  { id: 'male-fast', name: '👨 Мужской (энергичный)', lang: 'ru-RU', pitch: 0.85, rate: 1.1 },
+  { id: 'neutral', name: '-neutral Нейтральный', lang: 'ru-RU', pitch: 1.0, rate: 1.0 },
 ]
 
 const MAX_FILE_SIZE = 12 * 1024 * 1024 // 12 MB (raw file)
@@ -264,6 +275,7 @@ export default function ImageToVideoApp() {
     quality: 'speed',
     withAudio: false,
     voiceoverText: '',
+    voiceId: 'female-default',
     filter: 'none',
     bgMusic: 'none',
   })
@@ -829,6 +841,74 @@ export default function ImageToVideoApp() {
     }
 
     // Step 2: Try ZAI (cogvideox-3)
+    // If duration > 10s, use chunked generation (multiple 5s segments stitched together)
+    if (settings.duration > 10) {
+      setStage('polling')
+      setPollCount(1)
+      toast.info(`🎬 Чанковая генерация: ${settings.duration}с = ${Math.ceil(settings.duration / 5)} сегмента...`)
+      try {
+        const { res, data } = await fetchJsonSafely('/api/video/chunked', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageUrl: resizedDataUrl,
+            prompt: settings.prompt,
+            size: settings.size,
+            fps: settings.fps,
+            duration: settings.duration,
+            quality: settings.quality,
+          }),
+        })
+        if (res.ok && data.videoUrl) {
+          setVideoUrl(data.videoUrl)
+          setStage('success')
+          toast.success(`Видео готово! (${data.chunks} сегментов, ${data.totalDuration}с)`)
+
+          // Update stats
+          const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + (data.totalDuration || settings.duration) }
+          setStats(newStats)
+          localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+          // Play voiceover
+          if (settings.withAudio && settings.voiceoverText.trim()) {
+            try {
+              const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
+              const u = new SpeechSynthesisUtterance(settings.voiceoverText)
+              u.lang = voice.lang
+              u.pitch = voice.pitch
+              u.rate = voice.rate
+              const voices = window.speechSynthesis.getVoices()
+              const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+              if (ruVoice) u.voice = ruVoice
+              window.speechSynthesis.speak(u)
+            } catch { /* ignore */ }
+          }
+
+          // Save history
+          try {
+            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+            const item: HistoryItem = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              prompt: settings.prompt || '(chunked)',
+              imageUrl: thumb,
+              videoUrl: data.videoUrl,
+              createdAt: Date.now(),
+              thumb,
+            }
+            const next = [item, ...history].slice(0, 12)
+            setHistory(next)
+            persistHistory(next)
+          } catch { /* ignore */ }
+          return
+        }
+        // Chunked failed — fall through to single ZAI
+        toast.info('Чанковая генерация не удалась. Пробую обычную...')
+      } catch (err) {
+        console.warn('[generate] chunked failed, falling back to single:', err)
+        toast.info('Чанковая генерация не удалась. Пробую обычную...')
+      }
+    }
+
     setStage('creating')
     setPollCount(0)
     toast.info('Создаю задачу в нейросети ZAI…')
@@ -953,15 +1033,16 @@ export default function ImageToVideoApp() {
     // Play Russian voiceover if enabled
     if (settings.withAudio && settings.voiceoverText.trim()) {
       try {
+        const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
         const utterance = new SpeechSynthesisUtterance(settings.voiceoverText)
-        utterance.lang = 'ru-RU'
-        utterance.rate = 0.95
-        // Try to find a Russian voice
+        utterance.lang = voice.lang
+        utterance.pitch = voice.pitch
+        utterance.rate = voice.rate
         const voices = window.speechSynthesis.getVoices()
         const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
         if (ruVoice) utterance.voice = ruVoice
         window.speechSynthesis.speak(utterance)
-        toast.info('🔊 Озвучка воспроизводится...')
+        toast.info(`🔊 Озвучка: ${voice.name}`)
       } catch {
         toast.error('Не удалось воспроизвести озвучку')
       }
@@ -1494,6 +1575,24 @@ export default function ImageToVideoApp() {
                 {settings.withAudio && (
                   <div className="mt-3 rounded-xl border border-fuchsia-400/20 bg-fuchsia-500/5 p-3">
                     <Label className="mb-2 block text-xs text-fuchsia-200">
+                      🎙️ Голос озвучки:
+                    </Label>
+                    <Select
+                      value={settings.voiceId}
+                      onValueChange={(v) => setSettings((s) => ({ ...s, voiceId: v }))}
+                    >
+                      <SelectTrigger className="mb-3 border-white/10 bg-white/[0.04] text-white">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {VOICES.map((v) => (
+                          <SelectItem key={v.id} value={v.id}>
+                            {v.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Label className="mb-2 block text-xs text-fuchsia-200">
                       Текст для озвучивания (русский):
                     </Label>
                     <Textarea
@@ -1505,8 +1604,37 @@ export default function ImageToVideoApp() {
                       rows={2}
                       className="resize-none border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
                     />
-                    <p className="mt-1 text-[11px] text-white/40">
-                      Озвучка добавится к видео через браузерное TTS (бесплатно, без API)
+                    <div className="mt-2 flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          const voice = VOICES.find((v) => v.id === settings.voiceId)
+                          if (!voice || !settings.voiceoverText.trim()) {
+                            toast.error('Введите текст для озвучки')
+                            return
+                          }
+                          try {
+                            const u = new SpeechSynthesisUtterance(settings.voiceoverText)
+                            u.lang = voice.lang
+                            u.pitch = voice.pitch
+                            u.rate = voice.rate
+                            const voices = window.speechSynthesis.getVoices()
+                            const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+                            if (ruVoice) u.voice = ruVoice
+                            window.speechSynthesis.cancel()
+                            window.speechSynthesis.speak(u)
+                          } catch {
+                            toast.error('Не удалось воспроизвести')
+                          }
+                        }}
+                        className="border-fuchsia-400/30 bg-fuchsia-500/10 text-fuchsia-200 hover:bg-fuchsia-500/20"
+                      >
+                        ▶️ Прослушать
+                      </Button>
+                    </div>
+                    <p className="mt-2 text-[11px] text-white/40">
+                      Озвучка воспроизводится через браузерное TTS (бесплатно)
                     </p>
                   </div>
                 )}
