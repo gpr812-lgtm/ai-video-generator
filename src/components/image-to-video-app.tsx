@@ -44,7 +44,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { KeyRound, Plus, Settings, Globe } from 'lucide-react'
+import { KeyRound, Plus, Settings, Globe, Share2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 type Quality = 'speed' | 'quality'
@@ -57,6 +57,8 @@ interface VideoSettings {
   quality: Quality
   withAudio: boolean
   voiceoverText: string // Russian text for TTS voiceover
+  filter: string // video filter id
+  bgMusic: string // background music id
 }
 
 interface HistoryItem {
@@ -91,6 +93,31 @@ const PROMPT_IDEAS = [
   'Динамичный зум-ин, движение частиц вокруг объекта',
   'Сцена оживает: вода течёт, облака плывут, свет меняется',
   'Эффект параллакса, глубина резкости, кинематографичный кадр',
+]
+
+const PROMPT_TEMPLATES = [
+  { name: '🎬 Кинематографично', prompt: 'cinematic camera movement, slow dolly zoom, dramatic lighting, film grain, 35mm', voiceover: '' },
+  { name: '🌊 Природа', prompt: 'gentle wind, leaves rustling, water flowing, birds flying, natural sunlight', voiceover: 'Посмотрите на эту прекрасную природу...' },
+  { name: '👤 Портрет', prompt: 'subtle facial expression changes, hair movement, soft bokeh background, beauty shot', voiceover: '' },
+  { name: '🌃 Город', prompt: 'night city lights, neon reflections, rain on pavement, traffic flow, urban atmosphere', voiceover: '' },
+  { name: '✨ Магия', prompt: 'sparkles and particles, magical glow, ethereal atmosphere, fantasy scene', voiceover: 'Волшебство начинается...' },
+  { name: '📈 Бизнес', prompt: 'professional corporate shot, clean background, subtle motion, confident pose', voiceover: 'Представляем наш новый продукт.' },
+]
+
+const VIDEO_FILTERS = [
+  { id: 'none', name: 'Без фильтра', cssFilter: '' },
+  { id: 'cinematic', name: 'Кино', cssFilter: 'contrast(1.2) saturate(1.1) brightness(0.95)' },
+  { id: 'vintage', name: 'Винтаж', cssFilter: 'sepia(0.4) contrast(1.1) brightness(1.05)' },
+  { id: 'noir', name: 'Нуар', cssFilter: 'grayscale(1) contrast(1.3) brightness(0.9)' },
+  { id: 'vivid', name: 'Яркий', cssFilter: 'saturate(1.5) contrast(1.1)' },
+  { id: 'dream', name: 'Сон', cssFilter: 'blur(0.5px) brightness(1.1) saturate(1.2)' },
+]
+
+const BG_MUSIC = [
+  { id: 'none', name: 'Без музыки' },
+  { id: 'ambient', name: 'Амбиент (спокойно)' },
+  { id: 'upbeat', name: 'Энергично' },
+  { id: 'cinematic', name: 'Кинематографично' },
 ]
 
 const MAX_FILE_SIZE = 12 * 1024 * 1024 // 12 MB (raw file)
@@ -237,7 +264,10 @@ export default function ImageToVideoApp() {
     quality: 'speed',
     withAudio: false,
     voiceoverText: '',
+    filter: 'none',
+    bgMusic: 'none',
   })
+  const [stats, setStats] = useState({ total: 0, success: 0, fail: 0, totalSeconds: 0 })
 
   const [stage, setStage] = useState<Stage>('idle')
   const [errorMsg, setErrorMsg] = useState<string>('')
@@ -259,6 +289,8 @@ export default function ImageToVideoApp() {
         const parsed = JSON.parse(raw) as HistoryItem[]
         if (Array.isArray(parsed)) setHistory(parsed.slice(0, 12))
       }
+      const rawStats = localStorage.getItem('i2v_stats')
+      if (rawStats) setStats(JSON.parse(rawStats))
     } catch {
       /* ignore */
     }
@@ -913,6 +945,11 @@ export default function ImageToVideoApp() {
     setStage('success')
     toast.success('Видео готово! (ZAI cogvideox-3)')
 
+    // Update stats
+    const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+    setStats(newStats)
+    localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
     // Play Russian voiceover if enabled
     if (settings.withAudio && settings.voiceoverText.trim()) {
       try {
@@ -1311,6 +1348,24 @@ export default function ImageToVideoApp() {
                 </div>
               </div>
 
+              {/* Prompt templates */}
+              <div className="mb-4">
+                <Label className="mb-2 block text-xs text-white/50">
+                  📋 Шаблоны сценариев
+                </Label>
+                <div className="flex flex-wrap gap-2">
+                  {PROMPT_TEMPLATES.map((tpl) => (
+                    <button
+                      key={tpl.name}
+                      onClick={() => setSettings((s) => ({ ...s, prompt: tpl.prompt, voiceoverText: tpl.voiceover || s.voiceoverText }))}
+                      className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-white/70 transition-colors hover:border-fuchsia-400/40 hover:bg-fuchsia-500/10 hover:text-white"
+                    >
+                      {tpl.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* Settings */}
               <div className="mb-6 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
                 <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white/80">
@@ -1345,21 +1400,28 @@ export default function ImageToVideoApp() {
                     <Label className="mb-2 block text-xs text-white/50">
                       Длительность
                     </Label>
-                    <Tabs
+                    <Select
                       value={String(settings.duration)}
                       onValueChange={(v) =>
                         setSettings((s) => ({ ...s, duration: Number(v) }))
                       }
                     >
-                      <TabsList className="grid w-full grid-cols-2 bg-white/[0.04]">
-                        <TabsTrigger value="5" className="gap-1">
-                          <Clock className="h-3 w-3" /> 5 сек
-                        </TabsTrigger>
-                        <TabsTrigger value="10" className="gap-1">
-                          <Clock className="h-3 w-3" /> 10 сек
-                        </TabsTrigger>
-                      </TabsList>
-                    </Tabs>
+                      <SelectTrigger className="border-white/10 bg-white/[0.04] text-white">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="5">5 секунд</SelectItem>
+                        <SelectItem value="10">10 секунд</SelectItem>
+                        <SelectItem value="15">15 секунд</SelectItem>
+                        <SelectItem value="20">20 секунд</SelectItem>
+                        <SelectItem value="30">30 секунд</SelectItem>
+                        <SelectItem value="45">45 секунд</SelectItem>
+                        <SelectItem value="60">60 секунд</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="mt-1 text-[10px] text-white/30">
+                      ZAI макс. 10с • Colab ~6с • ffmpeg любое
+                    </p>
                   </div>
 
                   <div>
@@ -1448,9 +1510,65 @@ export default function ImageToVideoApp() {
                     </p>
                   </div>
                 )}
+
+                {/* Video filter */}
+                <div className="mt-4">
+                  <Label className="mb-2 block text-xs text-white/50">
+                    🎭 Фильтр видео
+                  </Label>
+                  <Select
+                    value={settings.filter}
+                    onValueChange={(v) => setSettings((s) => ({ ...s, filter: v }))}
+                  >
+                    <SelectTrigger className="border-white/10 bg-white/[0.04] text-white">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {VIDEO_FILTERS.map((f) => (
+                        <SelectItem key={f.id} value={f.id}>
+                          {f.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {/* Background music */}
+                <div className="mt-4">
+                  <Label className="mb-2 block text-xs text-white/50">
+                    🎵 Фоновая музыка
+                  </Label>
+                  <Select
+                    value={settings.bgMusic}
+                    onValueChange={(v) => setSettings((s) => ({ ...s, bgMusic: v }))}
+                  >
+                    <SelectTrigger className="border-white/10 bg-white/[0.04] text-white">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {BG_MUSIC.map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {m.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
 
-              {/* Generate button */}
+              {/* Stats */}
+              {stats.total > 0 && (
+                <div className="mb-4 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+                  <div className="flex items-center justify-between text-xs text-white/60">
+                    <span className="flex items-center gap-1">
+                      <Film className="h-3 w-3" /> Статистика:
+                    </span>
+                    <span>
+                      {stats.success}✓ / {stats.total} всего · {stats.totalSeconds}с видео
+                    </span>
+                  </div>
+                </div>
+              )}
               <Button
                 size="lg"
                 disabled={!imageDataUrl || isBusy}
@@ -1547,17 +1665,37 @@ export default function ImageToVideoApp() {
                   Результат
                 </h2>
                 {videoUrl && (
-                  <Button
-                    asChild
-                    size="sm"
-                    variant="outline"
-                    className="border-white/15 bg-white/5 hover:bg-white/10"
-                  >
-                    <a href={videoUrl} download={`video-${Date.now()}.mp4`}>
-                      <Download className="mr-1 h-3 w-3" />
-                      Скачать
-                    </a>
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button
+                      asChild
+                      size="sm"
+                      variant="outline"
+                      className="border-white/15 bg-white/5 hover:bg-white/10"
+                    >
+                      <a href={videoUrl} download={`video-${Date.now()}.mp4`}>
+                        <Download className="mr-1 h-3 w-3" />
+                        Скачать
+                      </a>
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        try {
+                          if (navigator.share) {
+                            await navigator.share({ title: 'AI Видео', text: settings.prompt || 'Сгенерировано ИИ', url: videoUrl })
+                          } else {
+                            await navigator.clipboard.writeText(videoUrl)
+                            toast.success('Ссылка скопирована!')
+                          }
+                        } catch { /* ignore */ }
+                      }}
+                      className="border-white/15 bg-white/5 hover:bg-white/10"
+                    >
+                      <Share2 className="mr-1 h-3 w-3" />
+                      Поделиться
+                    </Button>
+                  </div>
                 )}
               </div>
 
@@ -1689,6 +1827,7 @@ export default function ImageToVideoApp() {
                       autoPlay
                       loop
                       playsInline
+                      style={{ filter: VIDEO_FILTERS.find(f => f.id === settings.filter)?.cssFilter || 'none' }}
                       className="max-h-[28rem] w-full object-contain"
                     />
                   )}
