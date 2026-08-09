@@ -44,10 +44,9 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { KeyRound, Plus, Settings, Zap, Globe } from 'lucide-react'
+import { KeyRound, Plus, Settings, Globe } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-type Engine = 'zai' | 'multi'
 type Quality = 'speed' | 'quality'
 
 interface VideoSettings {
@@ -94,7 +93,7 @@ const PROMPT_IDEAS = [
 ]
 
 const MAX_FILE_SIZE = 12 * 1024 * 1024 // 12 MB (raw file)
-const RESIZE_MAX_DIM = 1280 // resize longest side to this before uploading
+const RESIZE_MAX_DIM = 512 // resize longest side to this before uploading (smaller = faster upload)
 const POLL_INTERVAL = 4000
 const MAX_POLLS = 90
 
@@ -120,8 +119,14 @@ async function fetchJsonSafely(
   if (!contentType.includes('application/json') || text.trimStart().startsWith('<')) {
     // Gateway/HTML error page (Caddy 502, Next.js error page, etc.)
     if (res.status === 502 || res.status === 504) {
+      // Try to extract useful info from the HTML error
+      const hint = text.includes('timeout')
+        ? ' (таймаут — попробуйте ещё раз)'
+        : text.includes('connect')
+          ? ' (сервер занят — попробуйте через 5 сек)'
+          : ''
       throw new Error(
-        'Сервер временно недоступен (шлюз). Попробуйте снова через несколько секунд.',
+        `Сервер временно недоступен (шлюз${hint}). Попробуйте снова через несколько секунд.`,
       )
     }
     if (res.status === 500) {
@@ -257,26 +262,6 @@ export default function ImageToVideoApp() {
     }
   }, [])
 
-  // --- ZAI availability probe ---
-  // Check ONCE on page load (not polling — polling wastes rate limit quota).
-  const [zaiAvailable, setZaiAvailable] = useState<boolean | null>(null)
-  useEffect(() => {
-    let cancelled = false
-    const probe = async () => {
-      try {
-        const res = await fetch('/api/zai-probe', { signal: AbortSignal.timeout(10000) })
-        const data = await res.json()
-        if (!cancelled) setZaiAvailable(!!data.available)
-      } catch {
-        if (!cancelled) setZaiAvailable(null)
-      }
-    }
-    probe()
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
   // --- API keys management ---
   // ZAI limits each key to 1 video request per 10 min. The user can add extra
   // free keys (from other Z.ai accounts) to get more throughput.
@@ -289,10 +274,8 @@ export default function ImageToVideoApp() {
   const [keys, setKeys] = useState<KeyInfo[]>([])
   const [showKeyDialog, setShowKeyDialog] = useState(false)
 
-  // --- Multi-provider engine ---
-  // When engine === 'multi', the app uses HuggingFace/Segmind/Replicate
-  // (auto-fallback) instead of ZAI. This bypasses ZAI's 1-req/10-min limit.
-  const [engine, setEngine] = useState<Engine>('multi')
+  // --- Multi-provider engine (always multi — simplified) ---
+  const engine = 'multi'
   interface ProviderInfo {
     id: string
     name: string
@@ -710,7 +693,7 @@ export default function ImageToVideoApp() {
     setRetryTotal(0)
 
     // === UPLOAD FINISHED VIDEO (from Colab) ===
-    if (engine === 'multi' && uploadedVideoFile) {
+    if (uploadedVideoFile) {
       const objectUrl = URL.createObjectURL(uploadedVideoFile)
       setVideoUrl(objectUrl)
       setStage('success')
@@ -759,169 +742,149 @@ export default function ImageToVideoApp() {
       return
     }
 
-    // ===== MULTI-PROVIDER MODE (HuggingFace/Segmind/Replicate) =====
-    // Bypasses ZAI's rate limit entirely. Single request, auto-fallback.
-    if (engine === 'multi') {
-      setStage('polling')
-      setPollCount(1)
-      toast.info('Генерация через бесплатные провайдеры…')
+    // ===== ZAI REAL AI MODE =====
+    // ZAI cogvideox-3 is working again! Real AI video diffusion.
+    // Flow: create task (quick) → poll status (every 4s) → get video URL
+    if (true) {
+      setStage('creating')
+      setPollCount(0)
+      toast.info('Создаю задачу в нейросети ZAI…')
+
+      let taskId: string | null = null
       try {
-        const { res, data } = await fetchJsonSafely('/api/generate', {
+        // Step 1: Create task (quick, ~1s)
+        const { res, data } = await fetchJsonSafely('/api/video/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageBase64: resizedDataUrl.split(',')[1], // strip data: prefix
             prompt: settings.prompt,
+            imageUrl: resizedDataUrl, // data URL — server will strip prefix
+            quality: settings.quality,
+            withAudio: settings.withAudio,
             size: settings.size,
             fps: settings.fps,
             duration: settings.duration,
-            quality: settings.quality,
           }),
         })
-        if (!res.ok) {
-          throw new Error(data?.error || 'Все провайдеры не сработали')
-        }
-        setVideoUrl(data.videoUrl)
-        setStage('success')
-        toast.success(`Видео готово! (провайдер: ${data.provider})`)
 
-        // Save history
-        try {
-          const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-          const item: HistoryItem = {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            prompt: settings.prompt || '(без описания)',
-            imageUrl: thumb,
-            videoUrl: data.videoUrl,
-            createdAt: Date.now(),
-            thumb,
+        if (res.status === 429 && data?.retryable) {
+          // Rate limited — show countdown and retry
+          const waitSec = Math.max(30, Math.round((data.retryAfterMs || 30000) / 1000))
+          setStage('rate_limited')
+          setRateLimitWait(waitSec)
+          toast.error(`ZAI лимит. Повтор через ${waitSec}с…`)
+          for (let s = waitSec; s > 0; s--) {
+            if (cancelRef.current) break
+            setRateLimitWait(s)
+            await new Promise((r) => setTimeout(r, 1000))
           }
-          const next = [item, ...history].slice(0, 12)
-          setHistory(next)
-          persistHistory(next)
-        } catch {
-          /* ignore */
+          setRateLimitWait(0)
+          if (!cancelRef.current) {
+            setStage('creating')
+            // Retry create
+            const { res: res2, data: data2 } = await fetchJsonSafely('/api/video/create', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                prompt: settings.prompt,
+                imageUrl: resizedDataUrl,
+                quality: settings.quality,
+                withAudio: settings.withAudio,
+                size: settings.size,
+                fps: settings.fps,
+                duration: settings.duration,
+              }),
+            })
+            if (!res2.ok) throw new Error(data2?.error || 'Не удалось создать задачу')
+            taskId = data2.taskId
+          }
+        } else if (!res.ok) {
+          throw new Error(data?.error || 'Не удалось создать задачу')
+        } else {
+          taskId = data.taskId
         }
+
+        if (!taskId) throw new Error('Сервер не вернул идентификатор задачи')
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Не удалось сгенерировать видео'
+        const msg = err instanceof Error ? err.message : 'Ошибка создания задачи'
         setErrorMsg(msg)
         setStage('error')
         toast.error(msg)
+        return
       }
-      return
-    }
 
-    // ===== ZAI MODE (rate-limited, 1 req / 10 min / key) =====
-    // 2) Build a fallback chain of parameter presets.
-    //    The first preset is exactly what the user requested. If ZAI FAILs it
-    //    (some combinations like quality+10s+60fps are unsupported), we
-    //    progressively simplify toward the most compatible combination.
-    const presets: VideoSettings[] = [
-      settings, // user's exact choice
-      {
-        // Drop audio + force speed mode (image-to-video is pickier about these)
-        ...settings,
-        withAudio: false,
-        quality: 'speed',
-      },
-      {
-        // Also drop fps to 30 and duration to 5
-        ...settings,
-        withAudio: false,
-        quality: 'speed',
-        fps: 30,
-        duration: 5,
-      },
-      {
-        // The "safe" preset: 1280x720, 5s, 30fps, speed, no audio
-        prompt: settings.prompt,
-        size: '1280x720',
-        duration: 5,
-        fps: 30,
-        quality: 'speed' as const,
-        withAudio: false,
-      },
-    ]
-    // Deduplicate
-    const seen = new Set<string>()
-    const uniquePresets = presets.filter((p) => {
-      const key = JSON.stringify(p)
-      if (seen.has(key)) return false
-      seen.add(key)
-      return true
-    })
-
-    let lastVideoUrl: string | null = null
-    let usedPresetLabel: string | undefined
-    let lastErr: any = null
-
-    for (let i = 0; i < uniquePresets.length; i++) {
-      const preset = uniquePresets[i]
-      if (i > 0) {
-        toast.info(
-          `Пробую упрощённые параметры (вариант ${i + 1}/${uniquePresets.length})…`,
-        )
-      }
-      setStage('creating')
+      // Step 2: Poll for status (ZAI takes ~20-60s)
+      setStage('polling')
       setPollCount(0)
-      try {
-        const result = await runGenerateCycle(preset, resizedDataUrl)
-        lastVideoUrl = result.videoUrl
-        usedPresetLabel = result.presetLabel
-        break
-      } catch (err: any) {
-        lastErr = err
-        const kind = err?.kind || 'other'
-        // Don't retry on rate-limit (already retried inside) or 'other' errors
-        // (network, server) — those won't be fixed by changing params.
-        if (kind === 'rate_limited' || kind === 'other') {
-          break
-        }
-        // kind === 'fail' or 'timeout': try next preset if available
-        if (i < uniquePresets.length - 1) {
-          console.warn(
-            `[generate] preset ${i + 1} failed (${kind}): ${err.message}; trying next preset`,
-          )
-          continue
-        }
-        break
-      }
-    }
+      let lastVideoUrl: string | null = null
+      let consecutiveErrors = 0
 
-    if (!lastVideoUrl) {
-      const msg = lastErr?.message || 'Не удалось сгенерировать видео.'
-      setErrorMsg(msg)
-      setStage('error')
-      toast.error(msg)
+      while (pollCount < MAX_POLLS) {
+        if (cancelRef.current) break
+        setPollCount(p => p + 1)
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL))
+
+        try {
+          const { res, data } = await fetchJsonSafely(
+            `/api/video/status?taskId=${encodeURIComponent(taskId!)}`,
+          )
+          consecutiveErrors = 0
+          if (!res.ok) throw new Error(data?.error || 'Ошибка статуса')
+
+          if (data.status === 'SUCCESS' && data.videoUrl) {
+            lastVideoUrl = data.videoUrl
+            break
+          }
+          if (data.status === 'FAIL') {
+            throw new Error(data.errorMessage || 'Нейросеть не смогла сгенерировать видео')
+          }
+        } catch (err) {
+          consecutiveErrors++
+          if (consecutiveErrors >= 3) {
+            throw err
+          }
+          // Tolerate transient errors
+        }
+      }
+
+      if (cancelRef.current) {
+        setErrorMsg('Генерация отменена')
+        setStage('error')
+        return
+      }
+
+      if (!lastVideoUrl) {
+        setErrorMsg('Превышено время ожидания. Попробуйте ещё раз.')
+        setStage('error')
+        toast.error('Превышено время ожидания')
+        return
+      }
+
+      // Success!
+      setVideoUrl(lastVideoUrl)
+      setStage('success')
+      toast.success('Видео готово! (ZAI cogvideox-3)')
+
+      // Save history
+      try {
+        const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+        const item: HistoryItem = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          prompt: settings.prompt || '(без описания)',
+          imageUrl: thumb,
+          videoUrl: lastVideoUrl,
+          createdAt: Date.now(),
+          thumb,
+        }
+        const next = [item, ...history].slice(0, 12)
+        setHistory(next)
+        persistHistory(next)
+      } catch {
+        /* ignore */
+      }
       return
     }
-
-    setVideoUrl(lastVideoUrl)
-    setStage('success')
-    if (usedPresetLabel && usedPresetLabel !== 'пользовательские настройки') {
-      toast.success(`Видео готово! (использован пресет: ${usedPresetLabel})`)
-    } else {
-      toast.success('Видео готово!')
-    }
-
-    // Save history
-    try {
-      const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-      const item: HistoryItem = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        prompt: settings.prompt || '(без описания)',
-        imageUrl: thumb,
-        videoUrl: lastVideoUrl,
-        createdAt: Date.now(),
-        thumb,
-      }
-      const next = [item, ...history].slice(0, 12)
-      setHistory(next)
-      persistHistory(next)
-    } catch {
-      /* ignore */
-    }
-  }, [imageDataUrl, imageFile, settings, history, persistHistory, runGenerateCycle, engine])
+  }, [imageDataUrl, imageFile, settings, history, persistHistory])
 
   const cancelGeneration = useCallback(() => {
     cancelRef.current = true
@@ -986,37 +949,7 @@ export default function ImageToVideoApp() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Engine switcher: AI (ZAI) vs Preview (local ffmpeg) */}
-          <div className="flex items-center rounded-lg border border-white/15 bg-white/5 p-0.5">
-            <button
-              onClick={() => setEngine('zai')}
-              className={cn(
-                'flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
-                engine === 'zai'
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-500 text-white'
-                  : 'text-white/60 hover:text-white',
-              )}
-              title="Настоящий ИИ: cogvideox-3 (video diffusion). 1 запрос в 10 мин."
-            >
-              <Zap className="h-3 w-3" />
-              ZAI
-            </button>
-            <button
-              onClick={() => setEngine('multi')}
-              className={cn(
-                'flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
-                engine === 'multi'
-                  ? 'bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white'
-                  : 'text-white/60 hover:text-white',
-              )}
-              title="Настоящий ИИ: AI-кадры через Pollinations (Flux/SD). Бесплатно, без лимитов!"
-            >
-              <Globe className="h-3 w-3" />
-              ИИ Free
-            </button>
-          </div>
-
-          {/* Provider settings — always available so users can add AI keys */}
+          {/* Provider settings */}
           <Dialog open={showProvidersDialog} onOpenChange={setShowProvidersDialog}>
               <DialogTrigger asChild>
                 <Button
@@ -1169,185 +1102,17 @@ export default function ImageToVideoApp() {
               </DialogContent>
             </Dialog>
 
-          {/* ZAI badge + keys (only in ZAI mode) */}
-          {engine === 'zai' && (
-            <>
-              <Badge
-                variant="outline"
-                className={
-                  zaiAvailable === null
-                    ? 'border-white/15 bg-white/5 text-white/50'
-                    : zaiAvailable
-                      ? 'border-green-400/30 bg-green-500/10 text-green-300'
-                      : 'border-amber-400/30 bg-amber-500/10 text-amber-300'
-                }
-              >
-                {zaiAvailable === null ? (
-                  <>
-                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                    Проверка…
-                  </>
-                ) : zaiAvailable ? (
-                  <>
-                    <span className="mr-1 inline-block h-2 w-2 rounded-full bg-green-400" />
-                    ZAI доступен
-                  </>
-                ) : (
-                  <>
-                    <span className="mr-1 inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" />
-                    ZAI перегружен
-                  </>
-                )}
-              </Badge>
-
-          <Dialog open={showKeyDialog} onOpenChange={setShowKeyDialog}>
-            <DialogTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                className="border-white/15 bg-white/5 text-white/70 hover:bg-white/10"
-              >
-                <Settings className="mr-1 h-3 w-3" />
-                Ключи
-                {keys.length > 1 && (
-                  <span className="ml-1 rounded bg-fuchsia-500/30 px-1.5 py-0.5 text-[10px] font-bold text-fuchsia-200">
-                    {keys.length}
-                  </span>
-                )}
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="max-w-md border-white/15 bg-[#0f0f1e] text-white">
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2">
-                  <KeyRound className="h-4 w-4 text-fuchsia-300" />
-                  API ключи ZAI
-                </DialogTitle>
-              </DialogHeader>
-              <div className="space-y-4">
-                <div className="rounded-lg border border-white/10 bg-white/[0.03] p-3 text-xs text-white/60">
-                  ZAI даёт <span className="font-semibold text-white/80">1 запрос в 10 минут</span> на каждый API-ключ.
-                  Добавьте несколько бесплатных ключей (из разных аккаунтов z.ai), чтобы генерировать чаще.
-                  Приложение автоматически выбирает свободный ключ.
-                </div>
-
-                {/* Existing keys list */}
-                <div className="space-y-2">
-                  <div className="text-xs font-semibold uppercase tracking-wider text-white/40">
-                    Активные ключи ({keys.length})
-                  </div>
-                  {keys.map((k) => (
-                    <div
-                      key={k.apiKeyPreview}
-                      className="flex items-center justify-between rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2"
-                    >
-                      <div className="flex items-center gap-2">
-                        <KeyRound className="h-3 w-3 text-white/40" />
-                        <div>
-                          <div className="text-xs font-medium text-white/80">
-                            {k.label}
-                            {k.isDefault && (
-                              <span className="ml-1 text-[10px] text-white/40">(по умолчанию)</span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-white/40">{k.apiKeyPreview}</div>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        {k.secondsUntilFree > 0 ? (
-                          <Badge variant="outline" className="border-amber-400/30 bg-amber-500/10 text-[10px] text-amber-300">
-                            {Math.floor(k.secondsUntilFree / 60)}м {k.secondsUntilFree % 60}с
-                          </Badge>
-                        ) : (
-                          <Badge variant="outline" className="border-green-400/30 bg-green-500/10 text-[10px] text-green-300">
-                            свободен
-                          </Badge>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Add new key form */}
-                <div className="space-y-2 rounded-lg border border-white/10 bg-white/[0.02] p-3">
-                  <div className="text-xs font-semibold uppercase tracking-wider text-white/40">
-                    Добавить ключ
-                  </div>
-                  <Input
-                    placeholder="API key (например, Z.ai...)"
-                    value={newApiKey}
-                    onChange={(e) => setNewApiKey(e.target.value)}
-                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
-                  />
-                  <Input
-                    placeholder="Token (необязательно, из .z-ai-config)"
-                    value={newKeyToken}
-                    onChange={(e) => setNewKeyToken(e.target.value)}
-                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
-                  />
-                  <Input
-                    placeholder="Метка (необязательно, например: аккаунт-2)"
-                    value={newKeyLabel}
-                    onChange={(e) => setNewKeyLabel(e.target.value)}
-                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
-                  />
-                  {keyError && (
-                    <p className="text-xs text-red-400">{keyError}</p>
-                  )}
-                  <Button
-                    onClick={handleAddKey}
-                    size="sm"
-                    className="w-full bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white hover:opacity-90"
-                  >
-                    <Plus className="mr-1 h-3 w-3" />
-                    Добавить ключ
-                  </Button>
-                </div>
-
-                <div className="text-[11px] text-white/40">
-                  💡 Зарегистрируйте несколько бесплатных аккаунтов на{' '}
-                  <a href="https://z.ai" target="_blank" rel="noreferrer" className="text-fuchsia-300 underline">
-                    z.ai
-                  </a>
-                  , получите API-ключи и добавьте их сюда.
-                  С 5 ключами можно генерировать 1 видео каждые 2 минуты.
-                </div>
-              </div>
-            </DialogContent>
-          </Dialog>
-            </>
-          )}
         </div>
       </header>
 
       <main className="mx-auto max-w-7xl px-6 pb-16">
         {/* Info banner */}
-        {engine === 'multi' && (
-          <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
-            🤖 <strong>Режим «ИИ»</strong> — генерирует видео с помощью нейросети (Flux/Stable Diffusion через Pollinations).
-            Каждый кадр создаётся ИИ, затем склеивается с плавными переходами.
-            <strong> Полностью бесплатно, без ключей, без лимитов.</strong>
-            Генерация занимает ~50 секунд (создаётся 4-5 AI-кадров).
-            {zaiAvailable === true && ' ZAI также доступен для cogvideox-3 — переключитесь для video diffusion.'}
-          </div>
-        )}
-        {engine === 'zai' && zaiAvailable === false && (
-          <div className="mb-6 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100/80">
-            ⏳ <strong>ZAI исчерпал дневной лимит</strong> (1 запрос в 10 минут + дневной квота).
-            Лимит сбросится позже. Пока ждёте, можете:
-            {' '}
-            <button onClick={() => setShowProvidersDialog(true)} className="underline text-amber-300">
-              добавить бесплатный ключ Replicate/Segmind
-            </button>
-            {' '}
-            для неограниченной ИИ-генерации, или переключиться на «Превью» для быстрого результата.
-          </div>
-        )}
-        {engine === 'zai' && zaiAvailable === true && (
-          <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
-            ✅ <strong>ZAI доступен</strong> — настоящий ИИ (cogvideox-3). Загрузите изображение и нажмите «Сгенерировать».
-            Вода будет течь, волосы развеваться, объекты двигаться.
-          </div>
-        )}
+        <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
+          🤖 <strong>Настоящий ИИ (cogvideox-3)</strong> — видео генерируется нейросетью ZAI.
+          Вода течёт, волосы развеваются, объекты двигаются.
+          <strong> Бесплатно, без ключей.</strong> Генерация ~30-60 секунд.
+          Лимит: 1 запрос в 10 минут.
+        </div>
 
         {/* Hero */}
         <section className="mb-10 text-center">
@@ -1626,7 +1391,7 @@ export default function ImageToVideoApp() {
               </Button>
 
               {/* Upload finished video from Colab */}
-              {engine === 'multi' && imageDataUrl && (
+              {imageDataUrl && (
                 <div className="mt-3">
                   <input
                     type="file"

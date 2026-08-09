@@ -83,9 +83,10 @@ export async function generateAiFramesVideo(
   const width = opts.width || 512
   const height = opts.height || 512
 
-  // Number of key frames to generate (one per ~1 second of video)
-  const numFrames = Math.max(4, Math.min(8, duration))
-  // Each key frame is shown for ~1 second, with crossfade transitions
+  // REDUCED frames for speed — Caddy gateway times out at ~30s.
+  // 3 frames × ~3s each = ~9s generation + 2s ffmpeg = ~11s total.
+  const numFrames = 3
+  // Each key frame is shown for ~1.6 seconds, with crossfade transitions
   const frameDuration = duration / numFrames
 
   // Ensure output directory exists

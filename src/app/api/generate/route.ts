@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { generateVideo, ProviderError } from '@/lib/providers'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300 // 5 minutes — video gen is slow
+export const maxDuration = 120 // 2 minutes max (AI Frames takes ~50s)
 
 interface GenerateBody {
   imageUrl?: string
@@ -42,7 +42,6 @@ export async function POST(req: NextRequest) {
     })
   } catch (err) {
     if (err instanceof ProviderError) {
-      console.error('[generate] all providers failed:', err.message)
       return NextResponse.json(
         { error: err.message, retryable: err.retryable },
         { status: 502 },
