@@ -563,7 +563,7 @@ export default function ImageToVideoApp() {
             // Last attempt? Give up with a clear message.
             if (createAttempt >= MAX_CREATE_ATTEMPTS) {
               const e: any = new Error(
-                'Не удалось создать задачу после нескольких попыток. ZAI лимит: 1 запрос в 10 минут. Подождите 10 минут и попробуйте снова.',
+                'Не удалось создать задачу после нескольких попыток. ZAI лимит запросов. Подождите немного и попробуйте снова.',
               )
               e.kind = 'rate_limited'
               throw e
@@ -578,7 +578,7 @@ export default function ImageToVideoApp() {
               const mins = Math.floor(waitSec / 60)
               const secs = waitSec % 60
               toast.error(
-                `ZAI лимит: 1 запрос в 10 минут. Автоповтор через ${mins}м ${secs}с — оставьте вкладку открытой.`,
+                `ZAI лимит запросов. Автоповтор через ${mins}м ${secs}с — оставьте вкладку открытой.`,
               )
             }
             for (let s = waitSec; s > 0; s--) {
@@ -1154,7 +1154,7 @@ export default function ImageToVideoApp() {
           {colabStatus?.connected ? (
             <span className="text-green-300"> ✅ Colab SVD подключен (без лимитов)</span>
           ) : (
-            <span className="text-amber-300"> ⚡ ZAI cogvideox-3 (1 запрос в 10 мин) — настройте Colab для безлимита</span>
+            <span className="text-amber-300"> ⚡ ZAI cogvideox-3 (лимит запросов) — настройте Colab для безлимита</span>
           )}
           <br />
           <span className="text-xs">
@@ -1595,7 +1595,7 @@ export default function ImageToVideoApp() {
                           …
                         </p>
                         <p className="mt-2 text-xs text-white/40">
-                          Лимит ZAI: 1 запрос в 10 минут. Окно откроется
+                          Лимит ZAI: окно откроется. Окно откроется
                           автоматически — оставьте вкладку открытой.
                         </p>
                       </div>

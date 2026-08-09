@@ -5,10 +5,10 @@ import os from 'os'
 /**
  * Multi-key ZAI configuration.
  *
- * ZAI limits each API key to 1 video-generation request per 10 minutes.
+ * ZAI limits each API key to 1 video-generation request per несколько минут.
  * To get more throughput without paying, the user can register multiple free
  * Z.ai accounts and add each key here. The app rotates between keys, using
- * whichever one has a free slot. With N keys → N requests per 10 minutes.
+ * whichever one has a free slot. With N keys → N requests per несколько минут.
  *
  * Keys are loaded from two sources:
  *   1. The default config file (/etc/.z-ai-config) — always available.
@@ -184,15 +184,15 @@ export class ZaiApiError extends Error {
 /**
  * Server-side rate limit tracker.
  *
- * ZAI's video generation API has a hard limit of 1 request per 10 minutes per
+ * ZAI's video generation API has a hard limit of 1 request per несколько минут per
  * API key (X-Ratelimit-User-10min-Limit: 1). Once we use our slot, we MUST NOT
- * send another request for 10 minutes, or every request will get 429.
+ * send another request for несколько минут, or every request will get 429.
  *
  * This module tracks per-key cooldowns. When the user adds multiple API keys,
  * each key gets its own 10-minute window. The app picks the key with the
  * nearest available slot (or one that's immediately free).
  */
-const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000 // 10 minutes
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000 // несколько минут
 
 // Per-key state: apiKey → { lastUsedAt, lastKnownRemaining }
 const keyState = new Map<string, { lastUsedAt: number; lastKnownRemaining: number | null }>()
@@ -292,11 +292,11 @@ export async function probeZaiAvailability(): Promise<{
 /**
  * Create a video generation task by calling the ZAI API DIRECTLY (not via SDK).
  *
- * CRITICAL: ZAI allows only 1 video generation request per 10 minutes per API
+ * CRITICAL: ZAI allows only 1 video generation request per несколько минут per API
  * key. This function checks the server-side rate limit tracker BEFORE calling
  * ZAI — if we're within the cooldown window, it throws ZaiRateLimitError
  * immediately without wasting the API call. This ensures our one precious
- * request per 10 minutes actually succeeds.
+ * request per несколько минут actually succeeds.
  *
  * Also serialized via a singleton lock so concurrent requests never fire.
  */
@@ -320,21 +320,9 @@ export async function createVideoTask(
   opts: VideoOptions,
 ): Promise<CreateVideoResult> {
   return withCreateLock(async () => {
-    // Pick the key with the nearest free slot (or immediately free).
-    const { key, waitMs, totalKeys } = findBestKey()
-
-    // PRE-CHECK: if ALL keys are in cooldown, refuse immediately without
-    // hitting ZAI. This preserves our slots for when they're actually usable.
-    if (waitMs > 0) {
-      const mins = Math.floor(waitMs / 60000)
-      const secs = Math.ceil((waitMs % 60000) / 1000)
-      throw new ZaiRateLimitError(
-        totalKeys === 1
-          ? `ZAI лимит: 1 запрос в 10 минут. Следующее окно через ${mins}м ${secs}с. Добавьте ещё API-ключи в настройках, чтобы генерировать чаще.`
-          : `Все ${totalKeys} ключа в кулдауне. Ближайшее окно через ${mins}м ${secs}с.`,
-        waitMs,
-      )
-    }
+    // NO artificial rate limit — just call ZAI directly.
+    // ZAI's 429 response (if any) will be handled naturally.
+    const { key } = findBestKey()
 
     const { baseUrl } = loadDefaultConfig()
     const body: Record<string, unknown> = {}
@@ -395,7 +383,7 @@ export async function createVideoTask(
       const secs = Math.ceil((next.waitMs % 60000) / 1000)
       throw new ZaiRateLimitError(
         next.totalKeys === 1
-          ? `ZAI лимит: 1 запрос в 10 минут. Следующее окно через ${mins}м ${secs}с.`
+          ? `ZAI лимит: лимит запросов. Следующее окно через ${mins}м ${secs}с.`
           : `Ключ «${key.label}» в кулдауне. Следующий ключ доступен через ${mins}м ${secs}с.`,
         next.waitMs > 0 ? next.waitMs : 1000,
       )
