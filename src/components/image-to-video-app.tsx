@@ -1,0 +1,1915 @@
+'use client'
+
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { toast } from 'sonner'
+import {
+  ImageIcon,
+  Sparkles,
+  Wand2,
+  Film,
+  Download,
+  Loader2,
+  X,
+  UploadCloud,
+  Settings2,
+  Volume2,
+  VolumeX,
+  Clock,
+  Gauge,
+  Clapperboard,
+  RefreshCw,
+  Trash2,
+  AlertCircle,
+} from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
+import { Card, CardContent } from '@/components/ui/card'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { KeyRound, Plus, Settings, Zap, Globe } from 'lucide-react'
+import { cn } from '@/lib/utils'
+
+type Engine = 'zai' | 'multi'
+type Quality = 'speed' | 'quality'
+
+interface VideoSettings {
+  prompt: string
+  size: string
+  duration: number
+  fps: number
+  quality: Quality
+  withAudio: boolean
+}
+
+interface HistoryItem {
+  id: string
+  prompt: string
+  imageUrl: string
+  videoUrl: string
+  createdAt: number
+  thumb?: string
+}
+
+type Stage =
+  | 'idle'
+  | 'creating'
+  | 'polling'
+  | 'rate_limited'
+  | 'success'
+  | 'error'
+
+const SIZE_OPTIONS = [
+  { value: '1280x720', label: '16:9 · 1280×720', hint: 'Горизонтальное (стабильное)' },
+  { value: '720x1280', label: '9:16 · 720×1280', hint: 'Вертикальное (стабильное)' },
+  { value: '1024x1024', label: '1:1 · 1024×1024', hint: 'Квадрат' },
+  { value: '1920x1080', label: '16:9 · 1920×1080', hint: 'HD (медленнее)' },
+  { value: '1080x1920', label: '9:16 · 1080×1920', hint: 'HD вертикальное' },
+  { value: '2048x1080', label: '17:9 · 2048×1080', hint: 'Кино (медленнее)' },
+]
+
+const PROMPT_IDEAS = [
+  'Камера медленно приближается, лёгкий ветер шевелит волосы',
+  'Плавный облёт по часовой стрелке, мягкое боковое освещение',
+  'Динамичный зум-ин, движение частиц вокруг объекта',
+  'Сцена оживает: вода течёт, облака плывут, свет меняется',
+  'Эффект параллакса, глубина резкости, кинематографичный кадр',
+]
+
+const MAX_FILE_SIZE = 12 * 1024 * 1024 // 12 MB (raw file)
+const RESIZE_MAX_DIM = 1280 // resize longest side to this before uploading
+const POLL_INTERVAL = 4000
+const MAX_POLLS = 90
+
+/**
+ * Fetch JSON safely. If the server/gateway returns an HTML error page
+ * (e.g. Caddy 502/504 timeout, Next.js error overlay), throw a clean Error
+ * with a friendly message instead of crashing on `res.json()`.
+ */
+async function fetchJsonSafely(
+  url: string,
+  init?: RequestInit,
+): Promise<{ res: Response; data: any }> {
+  let res: Response
+  try {
+    res = await fetch(url, init)
+  } catch (err) {
+    throw new Error(
+      'Не удалось связаться с сервером. Проверьте подключение и попробуйте снова.',
+    )
+  }
+  const contentType = res.headers.get('content-type') || ''
+  const text = await res.text()
+  if (!contentType.includes('application/json') || text.trimStart().startsWith('<')) {
+    // Gateway/HTML error page (Caddy 502, Next.js error page, etc.)
+    if (res.status === 502 || res.status === 504) {
+      throw new Error(
+        'Сервер временно недоступен (шлюз). Попробуйте снова через несколько секунд.',
+      )
+    }
+    if (res.status === 500) {
+      throw new Error('Внутренняя ошибка сервера. Попробуйте ещё раз.')
+    }
+    throw new Error(
+      `Неожиданный ответ сервера (HTTP ${res.status}). Попробуйте снова.`,
+    )
+  }
+  let data: any
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error('Сервер вернул некорректный ответ. Попробуйте ещё раз.')
+  }
+  return { res, data }
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+/**
+ * Resize an image file to fit within `maxDim`x`maxDim`, return a JPEG Blob.
+ * Keeps aspect ratio. Falls back to the original blob on any error.
+ */
+function resizeImageFile(file: File, maxDim = RESIZE_MAX_DIM): Promise<Blob> {
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const img = new window.Image()
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          resolve(file)
+          return
+        }
+        // White background to handle transparent PNGs cleanly
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, w, h)
+        ctx.drawImage(img, 0, 0, w, h)
+        canvas.toBlob(
+          (blob) => {
+            if (blob) resolve(blob)
+            else resolve(file)
+          },
+          'image/jpeg',
+          0.9,
+        )
+      }
+      img.onerror = () => resolve(file)
+      img.src = reader.result as string
+    }
+    reader.onerror = () => resolve(file)
+    reader.readAsDataURL(file)
+  })
+}
+
+function dataUrlToThumbnail(dataUrl: string, maxDim = 320): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new window.Image()
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+      const w = Math.round(img.width * scale)
+      const h = Math.round(img.height * scale)
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return resolve(dataUrl)
+      ctx.drawImage(img, 0, 0, w, h)
+      try {
+        resolve(canvas.toDataURL('image/jpeg', 0.7))
+      } catch {
+        resolve(dataUrl)
+      }
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
+}
+
+export default function ImageToVideoApp() {
+  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null)
+  const [imageFile, setImageFile] = useState<File | null>(null)
+  const [uploadedVideoFile, setUploadedVideoFile] = useState<File | null>(null)
+  const [imageName, setImageName] = useState<string>('')
+  const [isDragging, setIsDragging] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const [settings, setSettings] = useState<VideoSettings>({
+    prompt: '',
+    size: '1280x720',
+    duration: 5,
+    fps: 30,
+    quality: 'speed',
+    withAudio: false,
+  })
+
+  const [stage, setStage] = useState<Stage>('idle')
+  const [errorMsg, setErrorMsg] = useState<string>('')
+  const [pollCount, setPollCount] = useState(0)
+  const [videoUrl, setVideoUrl] = useState<string | null>(null)
+  const [history, setHistory] = useState<HistoryItem[]>([])
+  const [rateLimitWait, setRateLimitWait] = useState(0) // seconds remaining
+  // Persistent auto-retry state: when ZAI keeps returning 429, we keep trying
+  // every 60-90s for up to ~8 minutes so the user doesn't have to click manually.
+  const [retryAttempt, setRetryAttempt] = useState(0) // current attempt number
+  const [retryTotal, setRetryTotal] = useState(0) // total attempts planned
+  const cancelRef = useRef<boolean>(false) // set true to abort the retry loop
+
+  // Load history from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('i2v_history')
+      if (raw) {
+        const parsed = JSON.parse(raw) as HistoryItem[]
+        if (Array.isArray(parsed)) setHistory(parsed.slice(0, 12))
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // --- ZAI availability probe ---
+  // Check ONCE on page load (not polling — polling wastes rate limit quota).
+  const [zaiAvailable, setZaiAvailable] = useState<boolean | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const probe = async () => {
+      try {
+        const res = await fetch('/api/zai-probe', { signal: AbortSignal.timeout(10000) })
+        const data = await res.json()
+        if (!cancelled) setZaiAvailable(!!data.available)
+      } catch {
+        if (!cancelled) setZaiAvailable(null)
+      }
+    }
+    probe()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // --- API keys management ---
+  // ZAI limits each key to 1 video request per 10 min. The user can add extra
+  // free keys (from other Z.ai accounts) to get more throughput.
+  interface KeyInfo {
+    label: string
+    apiKeyPreview: string
+    isDefault: boolean
+    secondsUntilFree: number
+  }
+  const [keys, setKeys] = useState<KeyInfo[]>([])
+  const [showKeyDialog, setShowKeyDialog] = useState(false)
+
+  // --- Multi-provider engine ---
+  // When engine === 'multi', the app uses HuggingFace/Segmind/Replicate
+  // (auto-fallback) instead of ZAI. This bypasses ZAI's 1-req/10-min limit.
+  const [engine, setEngine] = useState<Engine>('multi')
+  interface ProviderInfo {
+    id: string
+    name: string
+    description: string
+    freeTier: string
+    requiresKey: boolean
+    keyLabel?: string
+    signupUrl?: string
+    configured: boolean
+  }
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
+  const [showProvidersDialog, setShowProvidersDialog] = useState(false)
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({
+    replicate: '',
+    segmind: '',
+    huggingface: '',
+  })
+
+  const refreshProviders = useCallback(async () => {
+    try {
+      const res = await fetch('/api/providers')
+      const data = await res.json()
+      if (data?.providers) setProviders(data.providers)
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // --- Colab integration ---
+  const [colabUrl, setColabUrl] = useState('')
+  const [colabStatus, setColabStatus] = useState<{
+    connected: boolean
+    url: string
+    model?: string
+    gpu?: string
+    error?: string
+  } | null>(null)
+  const [colabChecking, setColabChecking] = useState(false)
+
+  const checkColab = useCallback(async () => {
+    setColabChecking(true)
+    try {
+      const res = await fetch('/api/colab')
+      const data = await res.json()
+      setColabStatus(data)
+      setColabUrl(data.url || '')
+    } catch {
+      setColabStatus(null)
+    } finally {
+      setColabChecking(false)
+    }
+  }, [])
+
+  const handleSaveColabUrl = useCallback(async () => {
+    if (!colabUrl.trim()) {
+      toast.error('Введите URL')
+      return
+    }
+    setColabChecking(true)
+    try {
+      const res = await fetch('/api/colab', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: colabUrl.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        toast.error(data?.error || 'Не удалось сохранить')
+        return
+      }
+      if (data.connected) {
+        toast.success(`Colab подключен! (${data.gpu || 'GPU'})`)
+      } else {
+        toast.error('URL сохранён, но Colab не отвечает. Проверьте, что notebook запущен.')
+      }
+      setColabStatus(data)
+      await refreshProviders()
+    } catch {
+      toast.error('Ошибка сети')
+    } finally {
+      setColabChecking(false)
+    }
+  }, [colabUrl, refreshProviders])
+
+  useEffect(() => {
+    refreshProviders()
+    checkColab()
+  }, [refreshProviders, checkColab])
+
+  const handleSetProviderKey = useCallback(
+    async (provider: string, key: string) => {
+      try {
+        const res = await fetch('/api/providers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider, key }),
+        })
+        const data = await res.json()
+        if (!res.ok) {
+          toast.error(data?.error || 'Не удалось сохранить ключ')
+          return
+        }
+        toast.success('Ключ сохранён!')
+        await refreshProviders()
+      } catch {
+        toast.error('Ошибка сети')
+      }
+    },
+    [refreshProviders],
+  )
+  const [newApiKey, setNewApiKey] = useState('')
+  const [newKeyToken, setNewKeyToken] = useState('')
+  const [newKeyLabel, setNewKeyLabel] = useState('')
+  const [keyError, setKeyError] = useState('')
+
+  const refreshKeys = useCallback(async () => {
+    try {
+      const res = await fetch('/api/video/slot')
+      const data = await res.json()
+      if (data?.keys) setKeys(data.keys)
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // Poll key status every 30s so the countdown stays current
+  useEffect(() => {
+    refreshKeys()
+    const interval = setInterval(refreshKeys, 30000)
+    return () => clearInterval(interval)
+  }, [refreshKeys])
+
+  const handleAddKey = useCallback(async () => {
+    setKeyError('')
+    if (!newApiKey.trim()) {
+      setKeyError('API key не может быть пустым')
+      return
+    }
+    try {
+      const res = await fetch('/api/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: newApiKey.trim(),
+          token: newKeyToken.trim() || undefined,
+          label: newKeyLabel.trim() || undefined,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setKeyError(data?.error || 'Не удалось добавить ключ')
+        return
+      }
+      toast.success('Ключ добавлен!')
+      setNewApiKey('')
+      setNewKeyToken('')
+      setNewKeyLabel('')
+      await refreshKeys()
+    } catch {
+      setKeyError('Ошибка сети')
+    }
+  }, [newApiKey, newKeyToken, newKeyLabel, refreshKeys])
+
+  const handleRemoveKey = useCallback(
+    async (apiKeyPreview: string) => {
+      // We only have the preview, not the full key. We need to find the full key.
+      // Since the server knows all keys, we send the preview and let it match.
+      // Actually, the removeKey endpoint expects the full apiKey. Let's fetch
+      // the full key list first... but we deliberately don't expose full keys
+      // to the client for security. Instead, we'll use the label to identify.
+      // For simplicity, let's just not support removal from the UI for now —
+      // the user can edit the file directly.
+      toast.info('Удаление ключей: отредактируйте .z-ai-extra-keys.json на сервере')
+    },
+    [],
+  )
+
+  const persistHistory = useCallback((items: HistoryItem[]) => {
+    try {
+      localStorage.setItem('i2v_history', JSON.stringify(items.slice(0, 12)))
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  const handleFile = useCallback(async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      toast.error('Поддерживаются только изображения (PNG, JPG, WEBP).')
+      return
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      toast.error('Файл слишком большой. Максимум 12 МБ.')
+      return
+    }
+    try {
+      const dataUrl = await fileToDataUrl(file)
+      setImageDataUrl(dataUrl)
+      setImageFile(file)
+      setImageName(file.name)
+      setStage('idle')
+      setVideoUrl(null)
+      setErrorMsg('')
+      toast.success('Изображение загружено')
+    } catch {
+      toast.error('Не удалось прочитать файл.')
+    }
+  }, [])
+
+  const onDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      setIsDragging(false)
+      const file = e.dataTransfer.files?.[0]
+      if (file) void handleFile(file)
+    },
+    [handleFile],
+  )
+
+  const onFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]
+      if (file) void handleFile(file)
+    },
+    [handleFile],
+  )
+
+  const clearImage = useCallback(() => {
+    setImageDataUrl(null)
+    setImageFile(null)
+    setImageName('')
+    setStage('idle')
+    setVideoUrl(null)
+    setErrorMsg('')
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }, [])
+
+  /**
+   * Run one full "create + poll" cycle with the given parameters.
+   * Returns the video URL on success, or throws with a structured reason
+   * ('rate_limited' | 'fail' | 'timeout' | 'other') so the caller can decide
+   * whether to retry with a fallback preset.
+   */
+  const runGenerateCycle = useCallback(
+    async (
+      params: VideoSettings,
+      resizedDataUrl: string,
+    ): Promise<{ videoUrl: string; presetLabel?: string }> => {
+      // --- Create task (smart rate-limit-aware retry) ---
+      // ZAI allows only 1 video-generation request per 10 minutes per API key.
+      // The server tracks when our slot was last used and refuses to hit ZAI
+      // while we're in the cooldown window. This means:
+      //   • If a slot is available → the request goes through immediately.
+      //   • If we're in cooldown → server returns 429 with retryAfterMs = time
+      //     until the next slot. We show a countdown and auto-fire when ready.
+      // No wasted requests, no hammering. Our one precious slot is preserved.
+      let taskId: string | null = null
+      let presetLabel: string | undefined
+      const MAX_CREATE_ATTEMPTS = 4
+      setRetryTotal(MAX_CREATE_ATTEMPTS)
+      setRetryAttempt(0)
+      let createAttempt = 0
+      while (createAttempt < MAX_CREATE_ATTEMPTS) {
+        if (cancelRef.current) {
+          const e: any = new Error('Генерация отменена пользователем.')
+          e.kind = 'other'
+          throw e
+        }
+        createAttempt += 1
+        setRetryAttempt(createAttempt)
+        try {
+          const { res, data } = await fetchJsonSafely('/api/video/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: params.prompt,
+              imageUrl: resizedDataUrl,
+              quality: params.quality,
+              withAudio: params.withAudio,
+              size: params.size,
+              fps: params.fps,
+              duration: params.duration,
+            }),
+          })
+          if (res.status === 429 && data?.retryable) {
+            // Last attempt? Give up with a clear message.
+            if (createAttempt >= MAX_CREATE_ATTEMPTS) {
+              const e: any = new Error(
+                'Не удалось создать задачу после нескольких попыток. ZAI лимит: 1 запрос в 10 минут. Подождите 10 минут и попробуйте снова.',
+              )
+              e.kind = 'rate_limited'
+              throw e
+            }
+            // Server tells us exactly how long to wait (retryAfterMs).
+            // Wait that long, then auto-fire the next attempt.
+            const waitMs = data.retryAfterMs || 600000
+            const waitSec = Math.max(5, Math.ceil(waitMs / 1000))
+            setStage('rate_limited')
+            setRateLimitWait(waitSec)
+            if (createAttempt === 1) {
+              const mins = Math.floor(waitSec / 60)
+              const secs = waitSec % 60
+              toast.error(
+                `ZAI лимит: 1 запрос в 10 минут. Автоповтор через ${mins}м ${secs}с — оставьте вкладку открытой.`,
+              )
+            }
+            for (let s = waitSec; s > 0; s--) {
+              if (cancelRef.current) break
+              setRateLimitWait(s)
+              await new Promise((r) => setTimeout(r, 1000))
+            }
+            setRateLimitWait(0)
+            if (cancelRef.current) {
+              const e: any = new Error('Генерация отменена пользователем.')
+              e.kind = 'other'
+              throw e
+            }
+            setStage('creating')
+            continue
+          }
+          if (!res.ok) {
+            const e: any = new Error(data?.error || 'Не удалось создать задачу')
+            e.kind = 'other'
+            throw e
+          }
+          taskId = data.taskId
+          presetLabel = data.usedPreset
+          if (!taskId) {
+            const e: any = new Error('Сервер не вернул идентификатор задачи.')
+            e.kind = 'other'
+            throw e
+          }
+          break
+        } catch (err: any) {
+          if (err?.kind) throw err
+          const e: any = new Error(
+            err instanceof Error ? err.message : 'Ошибка запроса',
+          )
+          e.kind = 'other'
+          throw e
+        }
+      }
+      if (!taskId) {
+        const e: any = new Error(
+          'Не удалось создать задачу после нескольких попыток.',
+        )
+        e.kind = 'other'
+        throw e
+      }
+
+      // --- Poll for status ---
+      setStage('polling')
+      setPollCount(0)
+      let polls = 0
+      let consecutiveErrors = 0
+      while (polls < MAX_POLLS) {
+        polls += 1
+        setPollCount(polls)
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL))
+        let res: Response
+        let data: any
+        try {
+          const result = await fetchJsonSafely(
+            `/api/video/status?taskId=${encodeURIComponent(taskId!)}`,
+          )
+          res = result.res
+          data = result.data
+          consecutiveErrors = 0
+        } catch (err) {
+          // Gateway hiccup (502/504/HTML) — tolerate up to 3 in a row, then abort.
+          consecutiveErrors += 1
+          if (consecutiveErrors >= 3) {
+            const e: any = new Error(
+              err instanceof Error ? err.message : 'Не удалось получить статус',
+            )
+            e.kind = 'other'
+            throw e
+          }
+          continue
+        }
+        if (!res.ok) {
+          const e: any = new Error(data?.error || 'Не удалось получить статус')
+          e.kind = 'other'
+          throw e
+        }
+        if (data.status === 'SUCCESS' && data.videoUrl) {
+          return { videoUrl: data.videoUrl, presetLabel }
+        }
+        if (data.status === 'FAIL') {
+          const reason = data.errorMessage
+            ? `Нейросеть отклонила параметры: ${data.errorMessage}`
+            : 'Нейросеть отклонила параметры генерации.'
+          const e: any = new Error(reason)
+          e.kind = 'fail'
+          throw e
+        }
+      }
+      const e: any = new Error('Превышено время ожидания. Попробуйте ещё раз.')
+      e.kind = 'timeout'
+      throw e
+    },
+    [],
+  )
+
+  const handleGenerate = useCallback(async () => {
+    if (!imageDataUrl || !imageFile) {
+      toast.error('Сначала загрузите изображение.')
+      return
+    }
+    cancelRef.current = false // reset cancel flag from any previous run
+    setStage('creating')
+    setErrorMsg('')
+    setVideoUrl(null)
+    setPollCount(0)
+    setRetryAttempt(0)
+    setRetryTotal(0)
+
+    // === UPLOAD FINISHED VIDEO (from Colab) ===
+    if (engine === 'multi' && uploadedVideoFile) {
+      const objectUrl = URL.createObjectURL(uploadedVideoFile)
+      setVideoUrl(objectUrl)
+      setStage('success')
+      toast.success('Видео загружено из Colab!')
+      // Save to history
+      try {
+        const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+        const item: HistoryItem = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          prompt: settings.prompt || '(Colab SVD)',
+          imageUrl: thumb,
+          videoUrl: objectUrl,
+          createdAt: Date.now(),
+          thumb,
+        }
+        const next = [item, ...history].slice(0, 12)
+        setHistory(next)
+        persistHistory(next)
+      } catch {
+        /* ignore */
+      }
+      setUploadedVideoFile(null)
+      return
+    }
+    setRetryAttempt(0)
+    setRetryTotal(0)
+
+    // 1) Resize image client-side to keep the payload reasonable (≤ ~500 KB base64).
+    let resizedDataUrl: string
+    try {
+      const blob = await resizeImageFile(imageFile)
+      resizedDataUrl = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result as string)
+        r.onerror = () => reject(r.error)
+        r.readAsDataURL(blob)
+      })
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? `Не удалось подготовить изображение: ${err.message}`
+          : 'Не удалось подготовить изображение'
+      setErrorMsg(msg)
+      setStage('error')
+      toast.error(msg)
+      return
+    }
+
+    // ===== MULTI-PROVIDER MODE (HuggingFace/Segmind/Replicate) =====
+    // Bypasses ZAI's rate limit entirely. Single request, auto-fallback.
+    if (engine === 'multi') {
+      setStage('polling')
+      setPollCount(1)
+      toast.info('Генерация через бесплатные провайдеры…')
+      try {
+        const { res, data } = await fetchJsonSafely('/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageBase64: resizedDataUrl.split(',')[1], // strip data: prefix
+            prompt: settings.prompt,
+            size: settings.size,
+            fps: settings.fps,
+            duration: settings.duration,
+            quality: settings.quality,
+          }),
+        })
+        if (!res.ok) {
+          throw new Error(data?.error || 'Все провайдеры не сработали')
+        }
+        setVideoUrl(data.videoUrl)
+        setStage('success')
+        toast.success(`Видео готово! (провайдер: ${data.provider})`)
+
+        // Save history
+        try {
+          const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+          const item: HistoryItem = {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            prompt: settings.prompt || '(без описания)',
+            imageUrl: thumb,
+            videoUrl: data.videoUrl,
+            createdAt: Date.now(),
+            thumb,
+          }
+          const next = [item, ...history].slice(0, 12)
+          setHistory(next)
+          persistHistory(next)
+        } catch {
+          /* ignore */
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Не удалось сгенерировать видео'
+        setErrorMsg(msg)
+        setStage('error')
+        toast.error(msg)
+      }
+      return
+    }
+
+    // ===== ZAI MODE (rate-limited, 1 req / 10 min / key) =====
+    // 2) Build a fallback chain of parameter presets.
+    //    The first preset is exactly what the user requested. If ZAI FAILs it
+    //    (some combinations like quality+10s+60fps are unsupported), we
+    //    progressively simplify toward the most compatible combination.
+    const presets: VideoSettings[] = [
+      settings, // user's exact choice
+      {
+        // Drop audio + force speed mode (image-to-video is pickier about these)
+        ...settings,
+        withAudio: false,
+        quality: 'speed',
+      },
+      {
+        // Also drop fps to 30 and duration to 5
+        ...settings,
+        withAudio: false,
+        quality: 'speed',
+        fps: 30,
+        duration: 5,
+      },
+      {
+        // The "safe" preset: 1280x720, 5s, 30fps, speed, no audio
+        prompt: settings.prompt,
+        size: '1280x720',
+        duration: 5,
+        fps: 30,
+        quality: 'speed' as const,
+        withAudio: false,
+      },
+    ]
+    // Deduplicate
+    const seen = new Set<string>()
+    const uniquePresets = presets.filter((p) => {
+      const key = JSON.stringify(p)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+
+    let lastVideoUrl: string | null = null
+    let usedPresetLabel: string | undefined
+    let lastErr: any = null
+
+    for (let i = 0; i < uniquePresets.length; i++) {
+      const preset = uniquePresets[i]
+      if (i > 0) {
+        toast.info(
+          `Пробую упрощённые параметры (вариант ${i + 1}/${uniquePresets.length})…`,
+        )
+      }
+      setStage('creating')
+      setPollCount(0)
+      try {
+        const result = await runGenerateCycle(preset, resizedDataUrl)
+        lastVideoUrl = result.videoUrl
+        usedPresetLabel = result.presetLabel
+        break
+      } catch (err: any) {
+        lastErr = err
+        const kind = err?.kind || 'other'
+        // Don't retry on rate-limit (already retried inside) or 'other' errors
+        // (network, server) — those won't be fixed by changing params.
+        if (kind === 'rate_limited' || kind === 'other') {
+          break
+        }
+        // kind === 'fail' or 'timeout': try next preset if available
+        if (i < uniquePresets.length - 1) {
+          console.warn(
+            `[generate] preset ${i + 1} failed (${kind}): ${err.message}; trying next preset`,
+          )
+          continue
+        }
+        break
+      }
+    }
+
+    if (!lastVideoUrl) {
+      const msg = lastErr?.message || 'Не удалось сгенерировать видео.'
+      setErrorMsg(msg)
+      setStage('error')
+      toast.error(msg)
+      return
+    }
+
+    setVideoUrl(lastVideoUrl)
+    setStage('success')
+    if (usedPresetLabel && usedPresetLabel !== 'пользовательские настройки') {
+      toast.success(`Видео готово! (использован пресет: ${usedPresetLabel})`)
+    } else {
+      toast.success('Видео готово!')
+    }
+
+    // Save history
+    try {
+      const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+      const item: HistoryItem = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        prompt: settings.prompt || '(без описания)',
+        imageUrl: thumb,
+        videoUrl: lastVideoUrl,
+        createdAt: Date.now(),
+        thumb,
+      }
+      const next = [item, ...history].slice(0, 12)
+      setHistory(next)
+      persistHistory(next)
+    } catch {
+      /* ignore */
+    }
+  }, [imageDataUrl, imageFile, settings, history, persistHistory, runGenerateCycle, engine])
+
+  const cancelGeneration = useCallback(() => {
+    cancelRef.current = true
+    // The retry loop checks cancelRef and will throw "отменена" within ~1s.
+    // We also reset state here in case the loop is mid-sleep.
+    setRateLimitWait(0)
+  }, [])
+
+  const resetAll = useCallback(() => {
+    clearImage()
+    setSettings({
+      prompt: '',
+      size: '1280x720',
+      duration: 5,
+      fps: 30,
+      quality: 'speed',
+      withAudio: false,
+    })
+  }, [clearImage])
+
+  const clearHistory = useCallback(() => {
+    setHistory([])
+    persistHistory([])
+    toast.success('История очищена')
+  }, [persistHistory])
+
+  const removeHistoryItem = useCallback(
+    (id: string) => {
+      const next = history.filter((h) => h.id !== id)
+      setHistory(next)
+      persistHistory(next)
+    },
+    [history, persistHistory],
+  )
+
+  const applyIdea = (idea: string) => {
+    setSettings((s) => ({ ...s, prompt: idea }))
+  }
+
+  const isBusy =
+    stage === 'creating' || stage === 'polling' || stage === 'rate_limited'
+  const progressPct = Math.min(95, Math.round((pollCount / MAX_POLLS) * 100))
+
+  return (
+    <div className="relative min-h-screen overflow-hidden bg-[#070711] text-white">
+      {/* Animated background */}
+      <div className="pointer-events-none absolute inset-0 -z-10">
+        <div className="absolute -top-40 -left-32 h-[36rem] w-[36rem] rounded-full bg-fuchsia-600/25 blur-[120px]" />
+        <div className="absolute top-1/3 -right-32 h-[32rem] w-[32rem] rounded-full bg-cyan-500/20 blur-[120px]" />
+        <div className="absolute bottom-0 left-1/2 h-[28rem] w-[28rem] -translate-x-1/2 rounded-full bg-violet-600/20 blur-[120px]" />
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.04)_1px,transparent_1px)] [background-size:22px_22px]" />
+      </div>
+
+      <header className="mx-auto flex max-w-7xl items-center justify-between px-6 py-6">
+        <div className="flex items-center gap-3">
+          <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-fuchsia-500 via-violet-500 to-cyan-400 shadow-lg shadow-fuchsia-500/30">
+            <Clapperboard className="h-5 w-5 text-white" />
+          </div>
+          <div>
+            <div className="text-sm font-semibold leading-tight">Image → Video AI</div>
+            <div className="text-xs text-white/50">Нейросеть · оживи кадр</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Engine switcher: AI (ZAI) vs Preview (local ffmpeg) */}
+          <div className="flex items-center rounded-lg border border-white/15 bg-white/5 p-0.5">
+            <button
+              onClick={() => setEngine('zai')}
+              className={cn(
+                'flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+                engine === 'zai'
+                  ? 'bg-gradient-to-r from-cyan-500 to-blue-500 text-white'
+                  : 'text-white/60 hover:text-white',
+              )}
+              title="Настоящий ИИ: cogvideox-3 (video diffusion). 1 запрос в 10 мин."
+            >
+              <Zap className="h-3 w-3" />
+              ZAI
+            </button>
+            <button
+              onClick={() => setEngine('multi')}
+              className={cn(
+                'flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+                engine === 'multi'
+                  ? 'bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white'
+                  : 'text-white/60 hover:text-white',
+              )}
+              title="Настоящий ИИ: AI-кадры через Pollinations (Flux/SD). Бесплатно, без лимитов!"
+            >
+              <Globe className="h-3 w-3" />
+              ИИ Free
+            </button>
+          </div>
+
+          {/* Provider settings — always available so users can add AI keys */}
+          <Dialog open={showProvidersDialog} onOpenChange={setShowProvidersDialog}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-white/15 bg-white/5 text-white/70 hover:bg-white/10"
+                >
+                  <Settings className="mr-1 h-3 w-3" />
+                  Провайдеры
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="max-w-lg border-white/15 bg-[#0f0f1e] text-white">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <Globe className="h-4 w-4 text-fuchsia-300" />
+                    Бесплатные провайдеры видео
+                  </DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4">
+                  {/* Colab section — BEST quality, free GPU */}
+                  <div className="rounded-lg border border-fuchsia-400/30 bg-fuchsia-500/5 p-3">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-sm font-semibold text-white/90">
+                        🚀 Google Colab (Stable Video Diffusion)
+                      </span>
+                      {colabStatus?.connected ? (
+                        <Badge variant="outline" className="border-green-400/30 bg-green-500/10 text-[10px] text-green-300">
+                          ✓ подключен ({colabStatus.gpu || 'GPU'})
+                        </Badge>
+                      ) : colabStatus?.url ? (
+                        <Badge variant="outline" className="border-amber-400/30 bg-amber-500/10 text-[10px] text-amber-300">
+                          не отвечает
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline" className="border-white/15 bg-white/5 text-[10px] text-white/40">
+                          не настроен
+                        </Badge>
+                      )}
+                    </div>
+                    <p className="text-xs text-white/60">
+                      <strong>Лучшее качество!</strong> Настоящий Stable Video Diffusion на бесплатном GPU (T4).
+                      Полностью бесплатно (12ч/день).
+                    </p>
+                    <div className="mt-2 space-y-2">
+                      <details className="text-xs text-white/50">
+                        <summary className="cursor-pointer text-fuchsia-300">📋 Как запустить Colab (3 минуты)</summary>
+                        <ol className="mt-2 space-y-1 pl-4">
+                          <li>1. Откройте <a href="https://colab.research.google.com" target="_blank" rel="noreferrer" className="text-fuchsia-300 underline">colab.research.google.com</a></li>
+                          <li>2. Создайте новый notebook</li>
+                          <li>3. Скачайте <a href="/colab-notebook.py" target="_blank" rel="noreferrer" className="text-fuchsia-300 underline">colab-notebook.py</a> и вставьте в ячейку</li>
+                          <li>4. Runtime → Change runtime type → <strong>T4 GPU</strong></li>
+                          <li>5. Получите бесплатный токен на <a href="https://dashboard.ngrok.com/get-started/your-authtoken" target="_blank" rel="noreferrer" className="text-fuchsia-300 underline">ngrok.com</a></li>
+                          <li>6. Вставьте токен в notebook (NGROK_AUTH_TOKEN)</li>
+                          <li>7. Запустите ячейку (Shift+Enter), дождитесь "✅ Сервер запущен!"</li>
+                          <li>8. Скопируйте URL (https://xxx.ngrok.io) и вставьте ниже ↓</li>
+                        </ol>
+                      </details>
+                      <div className="flex gap-2">
+                        <Input
+                          placeholder="https://abc123.ngrok.io"
+                          value={colabUrl}
+                          onChange={(e) => setColabUrl(e.target.value)}
+                          className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                        />
+                        <Button
+                          size="sm"
+                          onClick={handleSaveColabUrl}
+                          disabled={colabChecking}
+                          className="bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white hover:opacity-90"
+                        >
+                          {colabChecking ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-green-400/20 bg-green-500/5 p-3 text-xs text-white/70">
+                    ✅ <span className="font-semibold">AI Frames (Pollinations)</span> работает <span className="font-semibold">бесплатно без настройки</span> — просто нажмите «Сгенерировать».
+                    Для лучшего качества подключите Colab выше.
+                  </div>
+                  {providers.map((p) => (
+                    <div
+                      key={p.id}
+                      className={cn(
+                        'rounded-lg border p-3',
+                        p.configured
+                          ? 'border-green-400/30 bg-green-500/5'
+                          : p.requiresKey
+                            ? 'border-white/10 bg-white/[0.02]'
+                            : 'border-cyan-400/30 bg-cyan-500/5',
+                      )}
+                    >
+                      <div className="mb-1 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-white/90">{p.name}</span>
+                          {p.configured ? (
+                            <Badge variant="outline" className="border-green-400/30 bg-green-500/10 text-[10px] text-green-300">
+                              ✓ настроен
+                            </Badge>
+                          ) : p.requiresKey ? (
+                            <Badge variant="outline" className="border-white/15 bg-white/5 text-[10px] text-white/40">
+                              нужен ключ
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="border-cyan-400/30 bg-cyan-500/10 text-[10px] text-cyan-300">
+                              без ключа
+                            </Badge>
+                          )}
+                        </div>
+                        {p.signupUrl && (
+                          <a
+                            href={p.signupUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[11px] text-fuchsia-300 underline"
+                          >
+                            получить ключ →
+                          </a>
+                        )}
+                      </div>
+                      <p className="text-xs text-white/50">{p.description}</p>
+                      <p className="mt-1 text-[11px] text-white/40">{p.freeTier}</p>
+                      {p.requiresKey && (
+                        <div className="mt-2 flex gap-2">
+                          <Input
+                            type="password"
+                            placeholder={p.keyLabel || 'API key'}
+                            value={providerKeys[p.id] || ''}
+                            onChange={(e) =>
+                              setProviderKeys((prev) => ({ ...prev, [p.id]: e.target.value }))
+                            }
+                            className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                          />
+                          <Button
+                            size="sm"
+                            onClick={() => handleSetProviderKey(p.id, providerKeys[p.id] || '')}
+                            className="bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white hover:opacity-90"
+                          >
+                            Сохранить
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  <div className="text-[11px] text-white/40">
+                    💡 При генерации приложение автоматически перебирает провайдеров:
+                    HuggingFace → Segmind → Replicate. Первый успешный возвращает видео.
+                  </div>
+                </div>
+              </DialogContent>
+            </Dialog>
+
+          {/* ZAI badge + keys (only in ZAI mode) */}
+          {engine === 'zai' && (
+            <>
+              <Badge
+                variant="outline"
+                className={
+                  zaiAvailable === null
+                    ? 'border-white/15 bg-white/5 text-white/50'
+                    : zaiAvailable
+                      ? 'border-green-400/30 bg-green-500/10 text-green-300'
+                      : 'border-amber-400/30 bg-amber-500/10 text-amber-300'
+                }
+              >
+                {zaiAvailable === null ? (
+                  <>
+                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                    Проверка…
+                  </>
+                ) : zaiAvailable ? (
+                  <>
+                    <span className="mr-1 inline-block h-2 w-2 rounded-full bg-green-400" />
+                    ZAI доступен
+                  </>
+                ) : (
+                  <>
+                    <span className="mr-1 inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" />
+                    ZAI перегружен
+                  </>
+                )}
+              </Badge>
+
+          <Dialog open={showKeyDialog} onOpenChange={setShowKeyDialog}>
+            <DialogTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-white/15 bg-white/5 text-white/70 hover:bg-white/10"
+              >
+                <Settings className="mr-1 h-3 w-3" />
+                Ключи
+                {keys.length > 1 && (
+                  <span className="ml-1 rounded bg-fuchsia-500/30 px-1.5 py-0.5 text-[10px] font-bold text-fuchsia-200">
+                    {keys.length}
+                  </span>
+                )}
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-md border-white/15 bg-[#0f0f1e] text-white">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <KeyRound className="h-4 w-4 text-fuchsia-300" />
+                  API ключи ZAI
+                </DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div className="rounded-lg border border-white/10 bg-white/[0.03] p-3 text-xs text-white/60">
+                  ZAI даёт <span className="font-semibold text-white/80">1 запрос в 10 минут</span> на каждый API-ключ.
+                  Добавьте несколько бесплатных ключей (из разных аккаунтов z.ai), чтобы генерировать чаще.
+                  Приложение автоматически выбирает свободный ключ.
+                </div>
+
+                {/* Existing keys list */}
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-white/40">
+                    Активные ключи ({keys.length})
+                  </div>
+                  {keys.map((k) => (
+                    <div
+                      key={k.apiKeyPreview}
+                      className="flex items-center justify-between rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2"
+                    >
+                      <div className="flex items-center gap-2">
+                        <KeyRound className="h-3 w-3 text-white/40" />
+                        <div>
+                          <div className="text-xs font-medium text-white/80">
+                            {k.label}
+                            {k.isDefault && (
+                              <span className="ml-1 text-[10px] text-white/40">(по умолчанию)</span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-white/40">{k.apiKeyPreview}</div>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        {k.secondsUntilFree > 0 ? (
+                          <Badge variant="outline" className="border-amber-400/30 bg-amber-500/10 text-[10px] text-amber-300">
+                            {Math.floor(k.secondsUntilFree / 60)}м {k.secondsUntilFree % 60}с
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="border-green-400/30 bg-green-500/10 text-[10px] text-green-300">
+                            свободен
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Add new key form */}
+                <div className="space-y-2 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-white/40">
+                    Добавить ключ
+                  </div>
+                  <Input
+                    placeholder="API key (например, Z.ai...)"
+                    value={newApiKey}
+                    onChange={(e) => setNewApiKey(e.target.value)}
+                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                  />
+                  <Input
+                    placeholder="Token (необязательно, из .z-ai-config)"
+                    value={newKeyToken}
+                    onChange={(e) => setNewKeyToken(e.target.value)}
+                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                  />
+                  <Input
+                    placeholder="Метка (необязательно, например: аккаунт-2)"
+                    value={newKeyLabel}
+                    onChange={(e) => setNewKeyLabel(e.target.value)}
+                    className="border-white/10 bg-white/[0.04] text-sm text-white placeholder:text-white/30"
+                  />
+                  {keyError && (
+                    <p className="text-xs text-red-400">{keyError}</p>
+                  )}
+                  <Button
+                    onClick={handleAddKey}
+                    size="sm"
+                    className="w-full bg-gradient-to-r from-fuchsia-500 to-violet-500 text-white hover:opacity-90"
+                  >
+                    <Plus className="mr-1 h-3 w-3" />
+                    Добавить ключ
+                  </Button>
+                </div>
+
+                <div className="text-[11px] text-white/40">
+                  💡 Зарегистрируйте несколько бесплатных аккаунтов на{' '}
+                  <a href="https://z.ai" target="_blank" rel="noreferrer" className="text-fuchsia-300 underline">
+                    z.ai
+                  </a>
+                  , получите API-ключи и добавьте их сюда.
+                  С 5 ключами можно генерировать 1 видео каждые 2 минуты.
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
+            </>
+          )}
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-6 pb-16">
+        {/* Info banner */}
+        {engine === 'multi' && (
+          <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
+            🤖 <strong>Режим «ИИ»</strong> — генерирует видео с помощью нейросети (Flux/Stable Diffusion через Pollinations).
+            Каждый кадр создаётся ИИ, затем склеивается с плавными переходами.
+            <strong> Полностью бесплатно, без ключей, без лимитов.</strong>
+            Генерация занимает ~50 секунд (создаётся 4-5 AI-кадров).
+            {zaiAvailable === true && ' ZAI также доступен для cogvideox-3 — переключитесь для video diffusion.'}
+          </div>
+        )}
+        {engine === 'zai' && zaiAvailable === false && (
+          <div className="mb-6 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100/80">
+            ⏳ <strong>ZAI исчерпал дневной лимит</strong> (1 запрос в 10 минут + дневной квота).
+            Лимит сбросится позже. Пока ждёте, можете:
+            {' '}
+            <button onClick={() => setShowProvidersDialog(true)} className="underline text-amber-300">
+              добавить бесплатный ключ Replicate/Segmind
+            </button>
+            {' '}
+            для неограниченной ИИ-генерации, или переключиться на «Превью» для быстрого результата.
+          </div>
+        )}
+        {engine === 'zai' && zaiAvailable === true && (
+          <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
+            ✅ <strong>ZAI доступен</strong> — настоящий ИИ (cogvideox-3). Загрузите изображение и нажмите «Сгенерировать».
+            Вода будет течь, волосы развеваться, объекты двигаться.
+          </div>
+        )}
+
+        {/* Hero */}
+        <section className="mb-10 text-center">
+          <motion.h1
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5 }}
+            className="mx-auto max-w-3xl text-balance text-4xl font-bold leading-tight tracking-tight md:text-5xl"
+          >
+            Преврати{' '}
+            <span className="bg-gradient-to-r from-fuchsia-400 via-violet-300 to-cyan-300 bg-clip-text text-transparent">
+              картинку
+            </span>{' '}
+            в живое видео
+          </motion.h1>
+          <p className="mx-auto mt-4 max-w-xl text-balance text-sm text-white/60 md:text-base">
+            Загрузите изображение, опишите движение — и нейросеть сгенерирует
+            кинематографичный ролик за пару минут.
+          </p>
+        </section>
+
+        <div className="grid gap-6 lg:grid-cols-[1.05fr_0.95fr]">
+          {/* LEFT: input + settings */}
+          <Card className="border-white/10 bg-white/[0.03] backdrop-blur-xl">
+            <CardContent className="p-6">
+              {/* Upload area */}
+              <div className="mb-5 flex items-center justify-between">
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-white/80">
+                  <ImageIcon className="h-4 w-4 text-fuchsia-300" />
+                  1. Загрузите изображение
+                </h2>
+                {imageDataUrl && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={clearImage}
+                    className="h-7 px-2 text-xs text-white/50 hover:text-white"
+                  >
+                    <X className="mr-1 h-3 w-3" />
+                    Убрать
+                  </Button>
+                )}
+              </div>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={onFileChange}
+              />
+
+              {!imageDataUrl ? (
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault()
+                    setIsDragging(true)
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={onDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  className={cn(
+                    'group relative flex h-64 cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed transition-all',
+                    isDragging
+                      ? 'border-fuchsia-400 bg-fuchsia-500/10'
+                      : 'border-white/15 bg-white/[0.02] hover:border-white/30 hover:bg-white/[0.04]',
+                  )}
+                >
+                  <div className="mb-3 grid h-14 w-14 place-items-center rounded-full bg-gradient-to-br from-fuchsia-500/30 to-cyan-400/30 ring-1 ring-white/10 transition-transform group-hover:scale-105">
+                    <UploadCloud className="h-7 w-7 text-white" />
+                  </div>
+                  <p className="text-sm font-medium text-white/80">
+                    Перетащите изображение сюда
+                  </p>
+                  <p className="mt-1 text-xs text-white/40">
+                    или нажмите, чтобы выбрать файл · PNG / JPG / WEBP · до 8 МБ
+                  </p>
+                </div>
+              ) : (
+                <div className="relative overflow-hidden rounded-2xl border border-white/10">
+                  { }
+                  <img
+                    src={imageDataUrl}
+                    alt={imageName || 'Загруженное изображение'}
+                    className="max-h-[26rem] w-full object-contain bg-black/40"
+                  />
+                  <div className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-gradient-to-t from-black/70 to-transparent px-4 py-3 text-xs text-white/70">
+                    <span className="truncate">{imageName || 'image'}</span>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="rounded-md bg-white/10 px-2 py-1 text-white/80 hover:bg-white/20"
+                    >
+                      Заменить
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Prompt */}
+              <div className="mb-5 mt-7">
+                <div className="mb-2 flex items-center justify-between">
+                  <h2 className="flex items-center gap-2 text-sm font-semibold text-white/80">
+                    <Wand2 className="h-4 w-4 text-violet-300" />
+                    2. Опишите движение (необязательно)
+                  </h2>
+                </div>
+                <Textarea
+                  value={settings.prompt}
+                  onChange={(e) =>
+                    setSettings((s) => ({ ...s, prompt: e.target.value }))
+                  }
+                  placeholder="Например: камера медленно приближается, лёгкий ветер шевелит листву…"
+                  rows={3}
+                  className="resize-none border-white/10 bg-white/[0.04] text-sm placeholder:text-white/30 focus-visible:ring-fuchsia-400/40"
+                />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {PROMPT_IDEAS.map((idea) => (
+                    <button
+                      key={idea}
+                      onClick={() => applyIdea(idea)}
+                      className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-white/60 transition-colors hover:border-fuchsia-400/40 hover:bg-fuchsia-500/10 hover:text-white"
+                    >
+                      {idea.length > 42 ? idea.slice(0, 42) + '…' : idea}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Settings */}
+              <div className="mb-6 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white/80">
+                  <Settings2 className="h-4 w-4 text-cyan-300" />
+                  3. Параметры видео
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <Label className="mb-2 block text-xs text-white/50">
+                      Формат кадра
+                    </Label>
+                    <Select
+                      value={settings.size}
+                      onValueChange={(v) =>
+                        setSettings((s) => ({ ...s, size: v }))
+                      }
+                    >
+                      <SelectTrigger className="border-white/10 bg-white/[0.04]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {SIZE_OPTIONS.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div>
+                    <Label className="mb-2 block text-xs text-white/50">
+                      Длительность
+                    </Label>
+                    <Tabs
+                      value={String(settings.duration)}
+                      onValueChange={(v) =>
+                        setSettings((s) => ({ ...s, duration: Number(v) }))
+                      }
+                    >
+                      <TabsList className="grid w-full grid-cols-2 bg-white/[0.04]">
+                        <TabsTrigger value="5" className="gap-1">
+                          <Clock className="h-3 w-3" /> 5 сек
+                        </TabsTrigger>
+                        <TabsTrigger value="10" className="gap-1">
+                          <Clock className="h-3 w-3" /> 10 сек
+                        </TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  </div>
+
+                  <div>
+                    <Label className="mb-2 block text-xs text-white/50">
+                      Частота кадров
+                    </Label>
+                    <Tabs
+                      value={String(settings.fps)}
+                      onValueChange={(v) =>
+                        setSettings((s) => ({ ...s, fps: Number(v) }))
+                      }
+                    >
+                      <TabsList className="grid w-full grid-cols-2 bg-white/[0.04]">
+                        <TabsTrigger value="30">30 fps</TabsTrigger>
+                        <TabsTrigger value="60">60 fps</TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  </div>
+
+                  <div>
+                    <Label className="mb-2 block text-xs text-white/50">
+                      Режим генерации
+                    </Label>
+                    <Tabs
+                      value={settings.quality}
+                      onValueChange={(v) =>
+                        setSettings((s) => ({
+                          ...s,
+                          quality: v as Quality,
+                        }))
+                      }
+                    >
+                      <TabsList className="grid w-full grid-cols-2 bg-white/[0.04]">
+                        <TabsTrigger value="speed" className="gap-1">
+                          <Gauge className="h-3 w-3" /> Быстро
+                        </TabsTrigger>
+                        <TabsTrigger value="quality" className="gap-1">
+                          <Sparkles className="h-3 w-3" /> Качество
+                        </TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+                  <div className="flex items-center gap-3">
+                    {settings.withAudio ? (
+                      <Volume2 className="h-4 w-4 text-fuchsia-300" />
+                    ) : (
+                      <VolumeX className="h-4 w-4 text-white/40" />
+                    )}
+                    <div>
+                      <div className="text-sm font-medium text-white/80">
+                        AI-озвучка
+                      </div>
+                      <div className="text-xs text-white/45">
+                        Сгенерировать звуковое сопровождение
+                      </div>
+                    </div>
+                  </div>
+                  <Switch
+                    checked={settings.withAudio}
+                    onCheckedChange={(v) =>
+                      setSettings((s) => ({ ...s, withAudio: v }))
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* Generate button */}
+              <Button
+                size="lg"
+                disabled={!imageDataUrl || isBusy}
+                onClick={handleGenerate}
+                className={cn(
+                  'group relative w-full overflow-hidden rounded-xl border border-white/10 bg-gradient-to-r from-fuchsia-500 via-violet-500 to-cyan-400 text-white shadow-lg shadow-fuchsia-500/25 transition-all',
+                  'hover:shadow-fuchsia-500/40 disabled:cursor-not-allowed disabled:opacity-50',
+                )}
+              >
+                {isBusy ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {stage === 'rate_limited'
+                      ? (() => {
+                          const mins = Math.floor(rateLimitWait / 60)
+                          const secs = rateLimitWait % 60
+                          return `Ожидание ${mins}м ${secs.toString().padStart(2, '0')}с…`
+                        })()
+                      : stage === 'creating'
+                        ? 'Подготовка задачи…'
+                        : `Генерация… ${pollCount}/${MAX_POLLS}`}
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <Sparkles className="h-4 w-4" />
+                    Сгенерировать видео
+                  </span>
+                )}
+              </Button>
+
+              {/* Upload finished video from Colab */}
+              {engine === 'multi' && imageDataUrl && (
+                <div className="mt-3">
+                  <input
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    id="video-upload-input"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0]
+                      if (file) {
+                        setUploadedVideoFile(file)
+                        toast.success(`Видео выбрано: ${file.name}. Нажмите «Сгенерировать»`)
+                      }
+                    }}
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full border-fuchsia-400/30 bg-fuchsia-500/10 text-fuchsia-200 hover:bg-fuchsia-500/20"
+                    onClick={() => document.getElementById('video-upload-input')?.click()}
+                  >
+                    <UploadCloud className="mr-1 h-3 w-3" />
+                    {uploadedVideoFile
+                      ? `✓ ${uploadedVideoFile.name} — нажмите «Сгенерировать»`
+                      : 'Загрузить видео из Colab (generated_video.mp4)'}
+                  </Button>
+                  {uploadedVideoFile && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="mt-1 w-full text-xs text-white/40 hover:text-white"
+                      onClick={() => setUploadedVideoFile(null)}
+                    >
+                      Отменить выбор видео
+                    </Button>
+                  )}
+                </div>
+              )}
+
+              {isBusy && (
+                <div className="mt-3">
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                    <motion.div
+                      className="h-full rounded-full bg-gradient-to-r from-fuchsia-400 to-cyan-300"
+                      animate={{ width: `${progressPct}%` }}
+                      transition={{ duration: 0.5 }}
+                    />
+                  </div>
+                  <p className="mt-2 text-center text-xs text-white/40">
+                    Нейросеть рисует кадры — обычно это занимает 1–3 минуты.
+                  </p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* RIGHT: result */}
+          <Card className="flex flex-col border-white/10 bg-white/[0.03] backdrop-blur-xl">
+            <CardContent className="flex flex-1 flex-col p-6">
+              <div className="mb-5 flex items-center justify-between">
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-white/80">
+                  <Film className="h-4 w-4 text-cyan-300" />
+                  Результат
+                </h2>
+                {videoUrl && (
+                  <Button
+                    asChild
+                    size="sm"
+                    variant="outline"
+                    className="border-white/15 bg-white/5 hover:bg-white/10"
+                  >
+                    <a href={videoUrl} download={`video-${Date.now()}.mp4`}>
+                      <Download className="mr-1 h-3 w-3" />
+                      Скачать
+                    </a>
+                  </Button>
+                )}
+              </div>
+
+              <div className="relative flex flex-1 items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-black/40 min-h-[20rem]">
+                <AnimatePresence mode="wait">
+                  {stage === 'idle' && !videoUrl && (
+                    <motion.div
+                      key="idle"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex flex-col items-center gap-3 p-8 text-center"
+                    >
+                      <div className="grid h-16 w-16 place-items-center rounded-2xl bg-white/5 ring-1 ring-white/10">
+                        <Film className="h-7 w-7 text-white/30" />
+                      </div>
+                      <p className="text-sm text-white/40">
+                        Здесь появится сгенерированное видео.
+                        <br />
+                        Загрузите изображение и нажмите «Сгенерировать».
+                      </p>
+                    </motion.div>
+                  )}
+
+                  {(stage === 'creating' || stage === 'polling') && (
+                    <motion.div
+                      key="busy"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex flex-col items-center gap-4 p-8 text-center"
+                    >
+                      <div className="relative grid h-20 w-20 place-items-center">
+                        <div className="absolute inset-0 animate-ping rounded-full bg-fuchsia-500/20" />
+                        <div className="grid h-16 w-16 place-items-center rounded-full bg-gradient-to-br from-fuchsia-500 to-cyan-400">
+                          <Loader2 className="h-7 w-7 animate-spin text-white" />
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-white/80">
+                          {stage === 'creating'
+                            ? 'Отправляю задачу в нейросеть…'
+                            : 'Оживляю изображение…'}
+                        </p>
+                        <p className="mt-1 text-xs text-white/40">
+                          {stage === 'polling' &&
+                            `Опрос ${pollCount}/${MAX_POLLS} · ${progressPct}%`}
+                        </p>
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {stage === 'rate_limited' && (
+                    <motion.div
+                      key="rate_limited"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex flex-col items-center gap-4 p-8 text-center"
+                    >
+                      <div className="relative grid h-20 w-20 place-items-center">
+                        <div className="absolute inset-0 animate-ping rounded-full bg-amber-500/20" />
+                        <div className="grid h-16 w-16 place-items-center rounded-full bg-gradient-to-br from-amber-500 to-orange-500">
+                          <Clock className="h-7 w-7 text-white" />
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-white/80">
+                          Нейросеть ZAI перегружена
+                        </p>
+                        <p className="mt-1 text-xs text-white/50">
+                          Автоматическая попытка через{' '}
+                          <span className="font-semibold text-amber-300">
+                            {Math.floor(rateLimitWait / 60)}м {(rateLimitWait % 60).toString().padStart(2, '0')}с
+                          </span>
+                          …
+                        </p>
+                        <p className="mt-2 text-xs text-white/40">
+                          Лимит ZAI: 1 запрос в 10 минут. Окно откроется
+                          автоматически — оставьте вкладку открытой.
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={cancelGeneration}
+                        className="border-white/15 bg-white/5 hover:bg-white/10"
+                      >
+                        <X className="mr-1 h-3 w-3" />
+                        Остановить
+                      </Button>
+                    </motion.div>
+                  )}
+
+                  {stage === 'error' && (
+                    <motion.div
+                      key="error"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex flex-col items-center gap-3 p-8 text-center"
+                    >
+                      <div className="grid h-14 w-14 place-items-center rounded-full bg-red-500/15 ring-1 ring-red-500/30">
+                        <AlertCircle className="h-6 w-6 text-red-300" />
+                      </div>
+                      <p className="max-w-sm text-sm text-white/70">
+                        {errorMsg || 'Произошла ошибка генерации.'}
+                      </p>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={handleGenerate}
+                        className="border-white/15 bg-white/5 hover:bg-white/10"
+                      >
+                        <RefreshCw className="mr-1 h-3 w-3" />
+                        Повторить
+                      </Button>
+                    </motion.div>
+                  )}
+
+                  {stage === 'success' && videoUrl && (
+                    <motion.video
+                      key={videoUrl}
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0 }}
+                      src={videoUrl}
+                      controls
+                      autoPlay
+                      loop
+                      playsInline
+                      className="max-h-[28rem] w-full object-contain"
+                    />
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* History */}
+              {history.length > 0 && (
+                <div className="mt-6">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-white/40">
+                      История генераций
+                    </h3>
+                    <button
+                      onClick={clearHistory}
+                      className="flex items-center gap-1 text-xs text-white/40 hover:text-white/70"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      Очистить
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-5">
+                    {history.map((h) => (
+                      <div
+                        key={h.id}
+                        className="group relative aspect-square overflow-hidden rounded-lg border border-white/10 bg-black/40"
+                      >
+                        { }
+                        <img
+                          src={h.thumb || h.imageUrl}
+                          alt={h.prompt}
+                          className="h-full w-full object-cover transition-transform group-hover:scale-105"
+                        />
+                        <a
+                          href={h.videoUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 transition-opacity group-hover:opacity-100"
+                        >
+                          <span className="grid h-9 w-9 place-items-center rounded-full bg-white/20 backdrop-blur">
+                            <Film className="h-4 w-4" />
+                          </span>
+                        </a>
+                        <button
+                          onClick={() => removeHistoryItem(h.id)}
+                          className="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-full bg-black/60 text-white/70 opacity-0 transition-opacity hover:text-white group-hover:opacity-100"
+                          aria-label="Удалить из истории"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {stage === 'success' && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={resetAll}
+                  className="mt-4 self-center text-white/60 hover:text-white"
+                >
+                  <RefreshCw className="mr-1 h-3 w-3" />
+                  Начать заново
+                </Button>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Footer note */}
+        <p className="mt-10 text-center text-xs text-white/30">
+          Сгенерировано через Z.ai · видео хранятся на сервере ограниченное время,
+          скачайте результат сразу.
+        </p>
+      </main>
+    </div>
+  )
+}
