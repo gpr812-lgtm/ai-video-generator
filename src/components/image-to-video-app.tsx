@@ -742,150 +742,192 @@ export default function ImageToVideoApp() {
       return
     }
 
-    // ===== ZAI REAL AI MODE =====
-    // ZAI cogvideox-3 is working again! Real AI video diffusion.
-    // Flow: create task (quick) → poll status (every 4s) → get video URL
-    if (true) {
-      setStage('creating')
-      setPollCount(0)
-      toast.info('Создаю задачу в нейросети ZAI…')
+    // ===== DUAL AI MODE: Colab SVD + ZAI cogvideox-3 =====
+    // Two real AI providers:
+    //   1. Google Colab (SVD) — if configured, no limits, best quality
+    //   2. ZAI (cogvideox-3) — free, but 1 req / 10 min rate limit
+    // If Colab is configured, try it first. If it fails, fall back to ZAI.
+    // If ZAI is rate-limited, show countdown and wait.
 
-      let taskId: string | null = null
+    // Step 1: Try Colab if configured
+    if (colabStatus?.connected && resizedDataUrl) {
+      setStage('polling')
+      setPollCount(1)
+      toast.info('🎨 Генерация через Google Colab (Stable Video Diffusion)…')
       try {
-        // Step 1: Create task (quick, ~1s)
-        const { res, data } = await fetchJsonSafely('/api/video/create', {
+        const { res, data } = await fetchJsonSafely('/api/generate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            imageBase64: resizedDataUrl.split(',')[1],
             prompt: settings.prompt,
-            imageUrl: resizedDataUrl, // data URL — server will strip prefix
-            quality: settings.quality,
-            withAudio: settings.withAudio,
-            size: settings.size,
-            fps: settings.fps,
-            duration: settings.duration,
+            provider: 'colab',
           }),
         })
-
-        if (res.status === 429 && data?.retryable) {
-          // Rate limited — show countdown and retry
-          const waitSec = Math.max(30, Math.round((data.retryAfterMs || 30000) / 1000))
-          setStage('rate_limited')
-          setRateLimitWait(waitSec)
-          toast.error(`ZAI лимит. Повтор через ${waitSec}с…`)
-          for (let s = waitSec; s > 0; s--) {
-            if (cancelRef.current) break
-            setRateLimitWait(s)
-            await new Promise((r) => setTimeout(r, 1000))
-          }
-          setRateLimitWait(0)
-          if (!cancelRef.current) {
-            setStage('creating')
-            // Retry create
-            const { res: res2, data: data2 } = await fetchJsonSafely('/api/video/create', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                prompt: settings.prompt,
-                imageUrl: resizedDataUrl,
-                quality: settings.quality,
-                withAudio: settings.withAudio,
-                size: settings.size,
-                fps: settings.fps,
-                duration: settings.duration,
-              }),
-            })
-            if (!res2.ok) throw new Error(data2?.error || 'Не удалось создать задачу')
-            taskId = data2.taskId
-          }
-        } else if (!res.ok) {
-          throw new Error(data?.error || 'Не удалось создать задачу')
-        } else {
-          taskId = data.taskId
+        if (res.ok && data.videoUrl) {
+          setVideoUrl(data.videoUrl)
+          setStage('success')
+          toast.success('Видео готово! (Colab SVD)')
+          // Save history
+          try {
+            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+            const item: HistoryItem = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              prompt: settings.prompt || '(Colab SVD)',
+              imageUrl: thumb,
+              videoUrl: data.videoUrl,
+              createdAt: Date.now(),
+              thumb,
+            }
+            const next = [item, ...history].slice(0, 12)
+            setHistory(next)
+            persistHistory(next)
+          } catch { /* ignore */ }
+          return
         }
-
-        if (!taskId) throw new Error('Сервер не вернул идентификатор задачи')
+        // Colab failed — fall through to ZAI
+        console.warn('[generate] Colab failed, falling back to ZAI:', data?.error)
+        toast.info('Colab не ответил. Пробую ZAI…')
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Ошибка создания задачи'
-        setErrorMsg(msg)
-        setStage('error')
-        toast.error(msg)
-        return
+        console.warn('[generate] Colab error, falling back to ZAI:', err)
+        toast.info('Colab недоступен. Пробую ZAI…')
       }
+    }
 
-      // Step 2: Poll for status (ZAI takes ~20-60s)
-      setStage('polling')
-      setPollCount(0)
-      let lastVideoUrl: string | null = null
-      let consecutiveErrors = 0
+    // Step 2: Try ZAI (cogvideox-3)
+    setStage('creating')
+    setPollCount(0)
+    toast.info('Создаю задачу в нейросети ZAI…')
 
-      while (pollCount < MAX_POLLS) {
-        if (cancelRef.current) break
-        setPollCount(p => p + 1)
-        await new Promise((r) => setTimeout(r, POLL_INTERVAL))
+    let taskId: string | null = null
+    try {
+      const { res, data } = await fetchJsonSafely('/api/video/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: settings.prompt,
+          imageUrl: resizedDataUrl,
+          quality: settings.quality,
+          withAudio: settings.withAudio,
+          size: settings.size,
+          fps: settings.fps,
+          duration: settings.duration,
+        }),
+      })
 
-        try {
-          const { res, data } = await fetchJsonSafely(
-            `/api/video/status?taskId=${encodeURIComponent(taskId!)}`,
-          )
-          consecutiveErrors = 0
-          if (!res.ok) throw new Error(data?.error || 'Ошибка статуса')
-
-          if (data.status === 'SUCCESS' && data.videoUrl) {
-            lastVideoUrl = data.videoUrl
-            break
-          }
-          if (data.status === 'FAIL') {
-            throw new Error(data.errorMessage || 'Нейросеть не смогла сгенерировать видео')
-          }
-        } catch (err) {
-          consecutiveErrors++
-          if (consecutiveErrors >= 3) {
-            throw err
-          }
-          // Tolerate transient errors
+      if (res.status === 429 && data?.retryable) {
+        // Rate limited — show countdown and retry
+        const waitSec = Math.max(30, Math.round((data.retryAfterMs || 30000) / 1000))
+        setStage('rate_limited')
+        setRateLimitWait(waitSec)
+        toast.error(`ZAI лимит. Повтор через ${waitSec}с…`)
+        for (let s = waitSec; s > 0; s--) {
+          if (cancelRef.current) break
+          setRateLimitWait(s)
+          await new Promise((r) => setTimeout(r, 1000))
         }
-      }
-
-      if (cancelRef.current) {
-        setErrorMsg('Генерация отменена')
-        setStage('error')
-        return
-      }
-
-      if (!lastVideoUrl) {
-        setErrorMsg('Превышено время ожидания. Попробуйте ещё раз.')
-        setStage('error')
-        toast.error('Превышено время ожидания')
-        return
-      }
-
-      // Success!
-      setVideoUrl(lastVideoUrl)
-      setStage('success')
-      toast.success('Видео готово! (ZAI cogvideox-3)')
-
-      // Save history
-      try {
-        const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-        const item: HistoryItem = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          prompt: settings.prompt || '(без описания)',
-          imageUrl: thumb,
-          videoUrl: lastVideoUrl,
-          createdAt: Date.now(),
-          thumb,
+        setRateLimitWait(0)
+        if (!cancelRef.current) {
+          setStage('creating')
+          const { res: res2, data: data2 } = await fetchJsonSafely('/api/video/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: settings.prompt,
+              imageUrl: resizedDataUrl,
+              quality: settings.quality,
+              withAudio: settings.withAudio,
+              size: settings.size,
+              fps: settings.fps,
+              duration: settings.duration,
+            }),
+          })
+          if (!res2.ok) throw new Error(data2?.error || 'Не удалось создать задачу')
+          taskId = data2.taskId
         }
-        const next = [item, ...history].slice(0, 12)
-        setHistory(next)
-        persistHistory(next)
-      } catch {
-        /* ignore */
+      } else if (!res.ok) {
+        throw new Error(data?.error || 'Не удалось создать задачу')
+      } else {
+        taskId = data.taskId
       }
+
+      if (!taskId) throw new Error('Сервер не вернул идентификатор задачи')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Ошибка создания задачи'
+      setErrorMsg(msg)
+      setStage('error')
+      toast.error(msg)
       return
     }
-  }, [imageDataUrl, imageFile, settings, history, persistHistory])
 
+    // Step 3: Poll for ZAI status
+    setStage('polling')
+    setPollCount(0)
+    let lastVideoUrl: string | null = null
+    let consecutiveErrors = 0
+
+    while (pollCount < MAX_POLLS) {
+      if (cancelRef.current) break
+      setPollCount(p => p + 1)
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL))
+
+      try {
+        const { res, data } = await fetchJsonSafely(
+          `/api/video/status?taskId=${encodeURIComponent(taskId!)}`,
+        )
+        consecutiveErrors = 0
+        if (!res.ok) throw new Error(data?.error || 'Ошибка статуса')
+
+        if (data.status === 'SUCCESS' && data.videoUrl) {
+          lastVideoUrl = data.videoUrl
+          break
+        }
+        if (data.status === 'FAIL') {
+          throw new Error(data.errorMessage || 'Нейросеть не смогла сгенерировать видео')
+        }
+      } catch (err) {
+        consecutiveErrors++
+        if (consecutiveErrors >= 3) {
+          throw err
+        }
+      }
+    }
+
+    if (cancelRef.current) {
+      setErrorMsg('Генерация отменена')
+      setStage('error')
+      return
+    }
+
+    if (!lastVideoUrl) {
+      setErrorMsg('Превышено время ожидания. Попробуйте ещё раз.')
+      setStage('error')
+      toast.error('Превышено время ожидания')
+      return
+    }
+
+    // Success!
+    setVideoUrl(lastVideoUrl)
+    setStage('success')
+    toast.success('Видео готово! (ZAI cogvideox-3)')
+
+    // Save history
+    try {
+      const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+      const item: HistoryItem = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        prompt: settings.prompt || '(без описания)',
+        imageUrl: thumb,
+        videoUrl: lastVideoUrl,
+        createdAt: Date.now(),
+        thumb,
+      }
+      const next = [item, ...history].slice(0, 12)
+      setHistory(next)
+      persistHistory(next)
+    } catch { /* ignore */ }
+    return
+  }, [imageDataUrl, imageFile, settings, history, persistHistory, colabStatus])
   const cancelGeneration = useCallback(() => {
     cancelRef.current = true
     // The retry loop checks cancelRef and will throw "отменена" within ~1s.
@@ -1108,10 +1150,18 @@ export default function ImageToVideoApp() {
       <main className="mx-auto max-w-7xl px-6 pb-16">
         {/* Info banner */}
         <div className="mb-6 rounded-xl border border-green-400/30 bg-green-500/10 px-4 py-3 text-sm text-green-100/80">
-          🤖 <strong>Настоящий ИИ (cogvideox-3)</strong> — видео генерируется нейросетью ZAI.
-          Вода течёт, волосы развеваются, объекты двигаются.
-          <strong> Бесплатно, без ключей.</strong> Генерация ~30-60 секунд.
-          Лимит: 1 запрос в 10 минут.
+          🤖 <strong>Настоящий ИИ видео</strong> — два движка:
+          {colabStatus?.connected ? (
+            <span className="text-green-300"> ✅ Colab SVD подключен (без лимитов)</span>
+          ) : (
+            <span className="text-amber-300"> ⚡ ZAI cogvideox-3 (1 запрос в 10 мин) — настройте Colab для безлимита</span>
+          )}
+          <br />
+          <span className="text-xs">
+            {colabStatus?.connected
+              ? 'Видео генерируется через Colab (SVD). Если Colab недоступен — через ZAI.'
+              : 'Нажмите «Провайдеры» → настройте Colab для безлимитной генерации (SVD на бесплатном GPU).'}
+          </span>
         </div>
 
         {/* Hero */}
