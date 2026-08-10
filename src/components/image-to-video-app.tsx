@@ -192,211 +192,10 @@ async function fetchJsonSafely(
   return { res, data }
 }
 
-/**
- * Generate AI video ENTIRELY in the browser.
- * Loads AI frames from Pollinations.ai → draws to Canvas → MediaRecorder → WebM.
- * NO server requests needed (except Pollinations.ai which is a public API).
- * This bypasses the preview gateway completely.
- */
-async function generateAIVideoClientSide(
-  prompt: string,
-  duration: number,
-  onProgress?: (done: number, total: number) => void,
-): Promise<Blob> {
-  const numFrames = Math.min(8, Math.max(4, Math.ceil(duration * 1.5)))
-  const W = 640
-  const H = 360
-  const fps = 25
-  const frameDuration = duration / numFrames
-
-  const motionWords = [
-    'wide shot', 'camera moves forward', 'zoom in', 'dynamic angle',
-    'closer view', 'camera pulls back', 'side angle', 'final frame',
-  ]
-
-  // Step 1: Load AI frames from Pollinations.ai directly in browser
-  const images: HTMLImageElement[] = []
-  for (let i = 0; i < numFrames; i++) {
-    const motionHint = motionWords[i % motionWords.length]
-    const framePrompt = `${prompt.slice(0, 150)}, ${motionHint}, cinematic`
-    const encoded = encodeURIComponent(framePrompt)
-    const seed = 1000 + i * 137
-    const imgUrl = `https://image.pollinations.ai/prompt/${encoded}?width=${W}&height=${H}&seed=${seed}&nologo=true&model=flux`
-
-    const img = new window.Image()
-    img.crossOrigin = 'anonymous'
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve()
-      img.onerror = () => reject(new Error(`Frame ${i + 1} failed`))
-      img.src = imgUrl
-    })
-    images.push(img)
-    onProgress?.(i + 1, numFrames)
-  }
-
-  // Step 2: Create canvas + MediaRecorder
-  const canvas = document.createElement('canvas')
-  canvas.width = W
-  canvas.height = H
-  const ctx = canvas.getContext('2d')!
-  const stream = canvas.captureStream(fps)
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-    ? 'video/webm;codecs=vp9'
-    : 'video/webm;codecs=vp8'
-  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2000000 })
-  const chunks: Blob[] = []
-  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
-
-  return new Promise((resolve, reject) => {
-    recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }))
-    recorder.onerror = () => reject(new Error('Recorder error'))
-    recorder.start()
-
-    // Step 3: Draw frames with smooth transitions
-    let currentFrame = 0
-    let frameProgress = 0
-    const totalFrames = numFrames * Math.round(frameDuration * fps)
-
-    function drawFrame() {
-      if (currentFrame >= numFrames) {
-        recorder.stop()
-        return
-      }
-
-      const img = images[currentFrame]
-      const progress = frameProgress / (frameDuration * fps)
-
-      // Draw with subtle zoom
-      const zoom = 1.0 + 0.05 * Math.sin(progress * Math.PI)
-      const drawW = W * zoom
-      const drawH = H * zoom
-      const x = (W - drawW) / 2
-      const y = (H - drawH) / 2
-
-      ctx.fillStyle = '#000'
-      ctx.fillRect(0, 0, W, H)
-      ctx.drawImage(img, x, y, drawW, drawH)
-
-      // Crossfade to next frame in last 20% of current frame
-      if (progress > 0.8 && currentFrame < numFrames - 1) {
-        const nextImg = images[currentFrame + 1]
-        ctx.globalAlpha = (progress - 0.8) / 0.2
-        ctx.drawImage(nextImg, x, y, drawW, drawH)
-        ctx.globalAlpha = 1
-      }
-
-      frameProgress++
-      if (frameProgress >= frameDuration * fps) {
-        currentFrame++
-        frameProgress = 0
-      }
-
-      requestAnimationFrame(drawFrame)
-    }
-    drawFrame()
-  })
-}
 
 /**
  * Generate a Ken Burns video entirely in the browser using Canvas + MediaRecorder.
  * No server request needed — works even when the gateway returns 502.
- * Creates a smooth zoom/pan animation from a static image.
- */
-async function generateClientSideVideo(
-  imageDataUrl: string,
-  duration: number,
-  prompt: string,
-): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    const img = new window.Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => {
-      const canvas = document.createElement('canvas')
-      const W = 640
-      const H = 360
-      canvas.width = W
-      canvas.height = H
-      const ctx = canvas.getContext('2d')
-      if (!ctx) {
-        reject(new Error('Canvas not supported'))
-        return
-      }
-
-      // Determine motion type from prompt
-      const p = prompt.toLowerCase()
-      let zoomDir = 1 // 1 = zoom in, -1 = zoom out
-      let panX = 0, panY = 0
-      if (p.includes('zoom out') || p.includes('отда')) zoomDir = -1
-      if (p.includes('pan right') || p.includes('вправ')) panX = 1
-      if (p.includes('pan left') || p.includes('влев')) panX = -1
-
-      // Setup MediaRecorder
-      const stream = canvas.captureStream(25) // 25 fps
-      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-        ? 'video/webm;codecs=vp9'
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-          ? 'video/webm;codecs=vp8'
-          : 'video/webm'
-
-      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2000000 })
-      const chunks: Blob[] = []
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data)
-      }
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' })
-        resolve(blob)
-      }
-      recorder.onerror = (e) => reject(new Error('Recorder error'))
-
-      recorder.start()
-
-      // Animate
-      const totalFrames = duration * 25
-      let frame = 0
-      const startZoom = zoomDir > 0 ? 1.0 : 1.2
-      const endZoom = zoomDir > 0 ? 1.2 : 1.0
-
-      function drawFrame() {
-        if (frame >= totalFrames) {
-          recorder.stop()
-          return
-        }
-
-        const progress = frame / totalFrames
-        const zoom = startZoom + (endZoom - startZoom) * progress
-        const offsetX = panX * progress * 50
-        const offsetY = 0
-
-        // Draw image with zoom/pan
-        ctx.fillStyle = '#000'
-        ctx.fillRect(0, 0, W, H)
-
-        const imgAspect = img.width / img.height
-        const canvasAspect = W / H
-        let drawW, drawH
-        if (imgAspect > canvasAspect) {
-          drawH = H * zoom
-          drawW = drawH * imgAspect
-        } else {
-          drawW = W * zoom
-          drawH = drawW / imgAspect
-        }
-        const x = (W - drawW) / 2 + offsetX
-        const y = (H - drawH) / 2 + offsetY
-
-        ctx.drawImage(img, x, y, drawW, drawH)
-
-        frame++
-        requestAnimationFrame(drawFrame)
-      }
-
-      drawFrame()
-    }
-    img.onerror = () => reject(new Error('Failed to load image'))
-    img.src = imageDataUrl
-  })
-}
 
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -1175,7 +974,7 @@ export default function ImageToVideoApp() {
       }
     }
 
-    // ===== 3. ERROR — no more Pollinations slideshow =====
+    // ===== 3. ERROR — Colab and ZAI both failed =====
     setErrorMsg("Не удалось создать видео. Настройте Colab для настоящего AI видео.")
     setStage("error")
     toast.error("Не удалось создать видео. Настройте Colab для настоящего AI видео.")
@@ -1322,7 +1121,7 @@ export default function ImageToVideoApp() {
                   </div>
 
                   <div className="rounded-lg border border-green-400/20 bg-green-500/5 p-3 text-xs text-white/70">
-                    ✅ <span className="font-semibold">AI Frames (Pollinations)</span> работает <span className="font-semibold">бесплатно без настройки</span> — просто нажмите «Сгенерировать».
+                    Настоящее AI видео через Colab SVD. Настройте Colab URL выше.
                     Для лучшего качества подключите Colab выше.
                   </div>
                   {providers.map((p) => (
