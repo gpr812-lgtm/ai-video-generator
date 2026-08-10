@@ -12,11 +12,12 @@ export const runtime = 'nodejs'
 export const maxDuration = 25
 
 /**
- * Standalone AI Video Generator — NO ZAI, NO API keys, NO limits.
- * Uses Pollinations.ai (free, open-source, Flux model) to generate
- * 10 AI frames, then stitches them into a video with ffmpeg.
- *
- * This is 100% free and works without any configuration.
+ * Standalone AI Video Generator — Pollinations.ai (Flux model).
+ * NO API keys, NO ZAI, NO limits.
+ * 
+ * Uses GET for ALL requests (works through preview gateway):
+ *   GET /api/ai-video?prompt=...&duration=5  → create session
+ *   GET /api/ai-video?sessionId=xxx          → poll status
  */
 
 interface Session {
@@ -32,39 +33,44 @@ interface Session {
 
 const sessions = new Map<string, Session>()
 
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json()
-    const { prompt, duration } = body as { prompt: string; duration?: number }
-    if (!prompt) return NextResponse.json({ error: 'Промпт обязателен' }, { status: 400 })
-
-    const sessionId = `aiv-${Date.now()}`
-    const totalDuration = duration || 5
-    const numFrames = Math.min(10, Math.max(5, Math.ceil(totalDuration * 2)))
-
-    const session: Session = {
-      id: sessionId, status: 'generating', framesDone: 0, framesTotal: numFrames,
-      prompt, duration: totalDuration,
-    }
-    sessions.set(sessionId, session)
-
-    generateInBackground(sessionId).catch((err) => {
-      session.status = 'error'
-      session.error = err instanceof Error ? err.message : 'Unknown error'
-    })
-
-    return NextResponse.json({ sessionId, framesTotal: numFrames, status: 'generating' })
-  } catch (err) {
-    return NextResponse.json({ error: err instanceof Error ? err.message : 'Failed' }, { status: 500 })
-  }
-}
-
 export async function GET(req: NextRequest) {
-  const sessionId = req.nextUrl.searchParams.get('sessionId')
-  if (!sessionId) return NextResponse.json({ error: 'sessionId required' }, { status: 400 })
-  const session = sessions.get(sessionId)
-  if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
-  return NextResponse.json(session)
+  const url = req.nextUrl
+  const sessionId = url.searchParams.get('sessionId')
+  const prompt = url.searchParams.get('prompt')
+
+  // Mode 1: Poll existing session
+  if (sessionId) {
+    const session = sessions.get(sessionId)
+    if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+    return NextResponse.json(session)
+  }
+
+  // Mode 2: Create new session
+  if (!prompt) {
+    return NextResponse.json({ error: 'Параметр prompt обязателен' }, { status: 400 })
+  }
+
+  const duration = parseInt(url.searchParams.get('duration') || '5', 10)
+  const numFrames = Math.min(10, Math.max(5, Math.ceil(duration * 2)))
+  const newSessionId = `aiv-${Date.now()}`
+
+  const session: Session = {
+    id: newSessionId,
+    status: 'generating',
+    framesDone: 0,
+    framesTotal: numFrames,
+    prompt: decodeURIComponent(prompt),
+    duration,
+  }
+  sessions.set(newSessionId, session)
+
+  // Start background generation
+  generateInBackground(newSessionId).catch((err) => {
+    session.status = 'error'
+    session.error = err instanceof Error ? err.message : 'Unknown error'
+  })
+
+  return NextResponse.json({ sessionId: newSessionId, framesTotal: numFrames, status: 'generating' })
 }
 
 async function generateInBackground(sessionId: string) {
@@ -105,10 +111,9 @@ async function generateInBackground(sessionId: string) {
       await fs.promises.writeFile(framePath, buf)
       framePaths.push(framePath)
       session.framesDone = i + 1
-      console.log(`[ai-video] ${sessionId} frame ${i + 1}/${session.framesTotal} done`)
+      console.log(`[ai-video] ${sessionId} frame ${i + 1}/${session.framesTotal}`)
     } catch (err) {
       console.warn(`[ai-video] frame ${i + 1} failed:`, err instanceof Error ? err.message : err)
-      // Retry once
       try {
         await sleep(3000)
         const res = await fetch(url, { signal: AbortSignal.timeout(30000) })
@@ -121,9 +126,7 @@ async function generateInBackground(sessionId: string) {
             session.framesDone = i + 1
           }
         }
-      } catch {
-        // Skip this frame
-      }
+      } catch { /* skip */ }
     }
     if (i < session.framesTotal - 1) await sleep(500)
   }
@@ -134,7 +137,6 @@ async function generateInBackground(sessionId: string) {
     return
   }
 
-  // Stitch with ffmpeg
   session.status = 'stitching'
   const outputPath = path.join(uploadsDir, `${sessionId}.mp4`)
   const escapeShell = (s: string) => `'${s.replace(/'/g, "'\\''")}'`

@@ -910,15 +910,9 @@ export default function ImageToVideoApp() {
       toast.info('🎨 Генерирую AI-кадры через нейросеть...')
 
       try {
-        // Create session (quick)
-        const aiVideoRes = await fetch('/api/ai-video', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: enhancedPrompt,
-            duration: settings.duration,
-          }),
-        })
+        // Create session using GET (works through preview gateway, no 502)
+        const encodedPrompt = encodeURIComponent(enhancedPrompt.slice(0, 500))
+        const aiVideoRes = await fetch(`/api/ai-video?prompt=${encodedPrompt}&duration=${settings.duration}`)
         const aiVideoData = await aiVideoRes.json()
 
         if (aiVideoRes.ok && aiVideoData.sessionId) {
