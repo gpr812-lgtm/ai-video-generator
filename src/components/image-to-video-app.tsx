@@ -897,38 +897,8 @@ export default function ImageToVideoApp() {
       return
     }
 
-    // ===== STEP 0: Enhance prompt using ZAI Vision =====
-    // Quick analysis (5-10s). If it fails, use original prompt.
+    // ===== STEP 0: Use prompt directly (NO ZAI Vision — avoids 429) =====
     let enhancedPrompt = settings.prompt
-    if (settings.prompt.trim()) {
-      setStage('creating')
-      toast.info('🔍 Анализирую изображение...')
-      try {
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 15000) // 15s max
-        const analyzeRes = await fetch('/api/analyze', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            imageUrl: resizedDataUrl,
-            userPrompt: settings.prompt,
-          }),
-          signal: controller.signal,
-        })
-        clearTimeout(timeout)
-
-        if (analyzeRes.ok) {
-          const analyzeData = await analyzeRes.json()
-          if (analyzeData.enhancedPrompt && analyzeData.enhancedPrompt.length > 20) {
-            enhancedPrompt = analyzeData.enhancedPrompt
-            toast.success('Промпт улучшен ИИ!')
-          }
-        }
-      } catch {
-        // If analyze fails (timeout, 500, etc.), use original prompt
-        console.warn('[generate] analyze failed, using original prompt')
-      }
-    }
 
     // ===== PRIMARY: AI Video via ZAI Image API (NO LIMITS!) =====
     // Generates 10 AI frames → stitches into video.
@@ -1313,7 +1283,7 @@ export default function ImageToVideoApp() {
           {colabStatus?.connected ? (
             <span className="text-green-300"> ✅ Colab SVD подключен (без лимитов)</span>
           ) : (
-            <span className="text-amber-300"> ⚡ ZAI cogvideox-3 (лимит запросов) — настройте Colab для безлимита</span>
+            <span className="text-amber-300"> 🎨 AI генерация кадров (без лимитов)</span>
           )}
           <br />
           <span className="text-xs">
@@ -2025,7 +1995,7 @@ export default function ImageToVideoApp() {
                       </div>
                       <div>
                         <p className="text-sm font-medium text-white/80">
-                          Нейросеть ZAI перегружена
+                          Генерация в процессе
                         </p>
                         <p className="mt-1 text-xs text-white/50">
                           Автоматическая попытка через{' '}
@@ -2035,8 +2005,7 @@ export default function ImageToVideoApp() {
                           …
                         </p>
                         <p className="mt-2 text-xs text-white/40">
-                          ZAI занят. Повтор через
-                          автоматически — оставьте вкладку открытой.
+                          ИИ генерирует кадры — оставьте вкладку открытой.
                         </p>
                       </div>
                       <Button
