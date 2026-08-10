@@ -910,8 +910,9 @@ export default function ImageToVideoApp() {
       toast.info('🎨 Генерирую AI-кадры через нейросеть...')
 
       try {
-        // Create session using GET (works through preview gateway, no 502)
-        const encodedPrompt = encodeURIComponent(enhancedPrompt.slice(0, 500))
+        // Use GET with SHORT prompt (max 200 chars) to avoid URL length limits
+        const shortPrompt = enhancedPrompt.slice(0, 200)
+        const encodedPrompt = encodeURIComponent(shortPrompt)
         const aiVideoRes = await fetch(`/api/ai-video?prompt=${encodedPrompt}&duration=${settings.duration}`)
         const aiVideoData = await aiVideoRes.json()
 
@@ -1045,10 +1046,10 @@ export default function ImageToVideoApp() {
       }
     }
 
-    // If AI video and Colab both failed, show error
-    setErrorMsg("AI-генерация не удалась. Попробуйте ещё раз — нейросеть могла быть занята.")
+    // If AI video and Colab both failed, show error with details
+    setErrorMsg("Не удалось создать видео. Проверьте подключение к интернету и попробуйте ещё раз.")
     setStage("error")
-    toast.error("AI-генерация не удалась. Попробуйте ещё раз.")
+    toast.error("Не удалось создать видео. Попробуйте ещё раз.")
   }, [imageDataUrl, imageFile, settings, history, persistHistory, colabStatus])
   const cancelGeneration = useCallback(() => {
     cancelRef.current = true
