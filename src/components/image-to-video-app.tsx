@@ -601,34 +601,51 @@ export default function ImageToVideoApp() {
     }
     setColabChecking(true)
     try {
-      const res = await fetch('/api/colab', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: colabUrl.trim() }),
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        toast.error(data?.error || 'Не удалось сохранить')
-        return
-      }
-      if (data.connected) {
-        toast.success(`Colab подключен! (${data.gpu || 'GPU'})`)
-      } else {
+      // Save URL in localStorage (NO server POST — avoids gateway 502)
+      localStorage.setItem('colab_url', colabUrl.trim())
+
+      // Check if Colab is reachable (direct browser → Colab, bypasses gateway)
+      try {
+        const healthRes = await fetch(`${colabUrl.trim()}/health`, {
+          signal: AbortSignal.timeout(10000),
+        })
+        if (healthRes.ok) {
+          const healthData = await healthRes.json()
+          setColabStatus({
+            connected: true,
+            url: colabUrl.trim(),
+            model: healthData.model,
+            gpu: healthData.gpu,
+          })
+          toast.success(`Colab подключен! (${healthData.gpu || 'GPU'})`)
+        } else {
+          setColabStatus({ connected: false, url: colabUrl.trim() })
+          toast.error('URL сохранён, но Colab не отвечает. Проверьте, что notebook запущен.')
+        }
+      } catch {
+        setColabStatus({ connected: false, url: colabUrl.trim() })
         toast.error('URL сохранён, но Colab не отвечает. Проверьте, что notebook запущен.')
       }
-      setColabStatus(data)
-      await refreshProviders()
     } catch {
-      toast.error('Ошибка сети')
+      toast.error('Ошибка')
     } finally {
       setColabChecking(false)
     }
-  }, [colabUrl, refreshProviders])
+  }, [colabUrl])
 
+  // Load Colab URL from localStorage on mount
   useEffect(() => {
+    const savedUrl = localStorage.getItem('colab_url')
+    if (savedUrl) {
+      setColabUrl(savedUrl)
+      // Check if it's still alive
+      fetch(`${savedUrl}/health`, { signal: AbortSignal.timeout(5000) })
+        .then(r => r.json())
+        .then(d => setColabStatus({ connected: true, url: savedUrl, model: d.model, gpu: d.gpu }))
+        .catch(() => setColabStatus({ connected: false, url: savedUrl }))
+    }
     refreshProviders()
-    checkColab()
-  }, [refreshProviders, checkColab])
+  }, [refreshProviders])
 
   const handleSetProviderKey = useCallback(
     async (provider: string, key: string) => {
@@ -1005,18 +1022,103 @@ export default function ImageToVideoApp() {
     // ===== STEP 0: Use prompt directly (NO ZAI Vision — avoids 429) =====
     let enhancedPrompt = settings.prompt
 
-    // ===== PRIMARY: AI Video via ZAI Image API (NO LIMITS!) =====
-    // Generates 10 AI frames → stitches into video.
-    // Uses ZAI Image API (30 req/10min) instead of Video API (1 req/10min).
-    // Each frame is REAL AI-generated content.
+    // ===== PRIMARY: Real AI Video via Colab SVD (direct connection, bypasses gateway) =====
+    // Browser connects DIRECTLY to Colab URL — no preview gateway involved.
+    // Sends: image + prompt + motion settings
+    // Receives: real SVD video (water flowing, hair moving, objects animating)
     {
       setStage('polling')
       setPollCount(0)
-      toast.info('🎨 Генерирую AI-кадры через нейросеть (в браузере)...')
+      toast.info('🎬 Генерирую настоящее AI видео через Colab (SVD)...')
 
+      // Get Colab URL from state
+      const colabUrl = colabStatus?.url || ''
+      if (!colabUrl) {
+        toast.info('Colab не настроен. Использую AI-кадры...')
+      } else {
+        try {
+          // Send image + prompt DIRECTLY to Colab (bypasses preview gateway)
+          const response = await fetch(`${colabUrl}/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              image: resizedDataUrl.split(',')[1],
+              prompt: enhancedPrompt.slice(0, 500),
+              motion_bucket_id: settings.quality === 'quality' ? 180 : 127,
+              fps: settings.fps === 60 ? 15 : 6,
+              num_frames: settings.duration > 10 ? 25 : 14,
+              seed: 42,
+            }),
+          })
+
+          if (response.ok) {
+            const data = await response.json()
+            if (data.status === 'ok' && data.video) {
+              // Convert base64 to blob URL
+              const videoBytes = atob(data.video)
+              const videoArray = new Uint8Array(videoBytes.length)
+              for (let i = 0; i < videoBytes.length; i++) videoArray[i] = videoBytes.charCodeAt(i)
+              const videoBlob = new Blob([videoArray], { type: 'video/mp4' })
+              const videoObjectUrl = URL.createObjectURL(videoBlob)
+
+              setVideoUrl(videoObjectUrl)
+              setStage('success')
+              toast.success('Настоящее AI видео готово! (SVD)')
+
+              // Update stats
+              const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+              setStats(newStats)
+              localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+              // Play voiceover
+              if (settings.withAudio) {
+                try {
+                  const textsToSpeak: string[] = []
+                  if (settings.dialogueMode) {
+                    settings.dialogue.forEach((line) => { if (line.text.trim()) textsToSpeak.push(line.text.trim()) })
+                  } else if (settings.voiceoverText.trim()) {
+                    textsToSpeak.push(settings.voiceoverText.trim())
+                  }
+                  for (const text of textsToSpeak) {
+                    try {
+                      const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
+                      if (ttsRes.ok) {
+                        const ttsData = await ttsRes.json()
+                        if (ttsData.audioUrl) {
+                          const audio = new Audio(ttsData.audioUrl)
+                          audio.play()
+                          await new Promise((r) => { audio.onended = r; audio.onerror = r })
+                        }
+                      }
+                    } catch {
+                      const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u)
+                    }
+                  }
+                } catch { /* ignore */ }
+              }
+
+              // Save history
+              try {
+                const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+                const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(SVD)', imageUrl: thumb, videoUrl: videoObjectUrl, createdAt: Date.now(), thumb }
+                const next = [item, ...history].slice(0, 12)
+                setHistory(next)
+                persistHistory(next)
+              } catch { /* ignore */ }
+              return
+            }
+          }
+          // Colab failed — fall through to AI frames
+          toast.info('Colab не ответил. Использую AI-кадры...')
+        } catch (err) {
+          console.warn('[generate] Colab failed:', err)
+          toast.info('Colab недоступен. Использую AI-кадры...')
+        }
+      }
+
+      // FALLBACK: Client-side AI frames (Pollinations)
+      toast.info('🎨 Генерирую AI-кадры через нейросеть...')
       try {
-        // 100% CLIENT-SIDE: no server requests, no gateway, no 502
-        // Loads AI frames from Pollinations.ai directly → Canvas → MediaRecorder
         const videoBlob = await generateAIVideoClientSide(
           enhancedPrompt,
           settings.duration,
@@ -1026,107 +1128,18 @@ export default function ImageToVideoApp() {
           },
         )
         const videoObjectUrl = URL.createObjectURL(videoBlob)
-
         setVideoUrl(videoObjectUrl)
         setStage('success')
-        toast.success('AI видео готово! (нейросетевые кадры)')
-
-        // Update stats
-        const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
-        setStats(newStats)
-        localStorage.setItem('i2v_stats', JSON.stringify(newStats))
-
-        // Play voiceover
-        if (settings.withAudio) {
-          try {
-            const textsToSpeak: string[] = []
-            if (settings.dialogueMode) {
-              settings.dialogue.forEach((line) => { if (line.text.trim()) textsToSpeak.push(line.text.trim()) })
-            } else if (settings.voiceoverText.trim()) {
-              textsToSpeak.push(settings.voiceoverText.trim())
-            }
-            for (const text of textsToSpeak) {
-              try {
-                const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
-                if (ttsRes.ok) {
-                  const ttsData = await ttsRes.json()
-                  if (ttsData.audioUrl) {
-                    const audio = new Audio(ttsData.audioUrl)
-                    audio.play()
-                    await new Promise((r) => { audio.onended = r; audio.onerror = r })
-                  }
-                }
-              } catch {
-                const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u)
-              }
-            }
-          } catch { /* ignore */ }
-        }
-
-        // Save history
-        try {
-          const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-          const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(AI)', imageUrl: thumb, videoUrl: videoObjectUrl, createdAt: Date.now(), thumb }
-          const next = [item, ...history].slice(0, 12)
-          setHistory(next)
-          persistHistory(next)
-        } catch { /* ignore */ }
+        toast.success('AI видео готово!')
         return
       } catch (err) {
-        console.warn('[generate] client AI video failed:', err)
-        throw err
+        console.warn('[generate] AI frames failed:', err)
       }
     }
-
-    // ===== FALLBACK: ZAI Video API (1 req / 10 min) — only if Colab configured =====
-    if (colabStatus?.connected && resizedDataUrl) {
-      setStage('polling')
-      setPollCount(1)
-      toast.info('🎨 Генерация через Google Colab (Stable Video Diffusion)…')
-      try {
-        const { res, data } = await fetchJsonSafely('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            imageBase64: resizedDataUrl.split(',')[1],
-            prompt: enhancedPrompt,
-            provider: 'colab',
-          }),
-        })
-        if (res.ok && data.videoUrl) {
-          setVideoUrl(data.videoUrl)
-          setStage('success')
-          toast.success('Видео готово! (Colab SVD)')
-          // Save history
-          try {
-            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-            const item: HistoryItem = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              prompt: settings.prompt || '(Colab SVD)',
-              imageUrl: thumb,
-              videoUrl: data.videoUrl,
-              createdAt: Date.now(),
-              thumb,
-            }
-            const next = [item, ...history].slice(0, 12)
-            setHistory(next)
-            persistHistory(next)
-          } catch { /* ignore */ }
-          return
-        }
-        // Colab failed — fall through to ZAI
-        console.warn('[generate] Colab failed, falling back to ZAI:', data?.error)
-        toast.info('Colab не ответил. Пробую ZAI…')
-      } catch (err) {
-        console.warn('[generate] Colab error, falling back to ZAI:', err)
-        toast.info('Colab недоступен. Пробую ZAI…')
-      }
-    }
-
-    // If AI video and Colab both failed, show error with details
-    setErrorMsg("Не удалось создать видео. Проверьте подключение к интернету и попробуйте ещё раз.")
+    // If all methods failed
+    setErrorMsg("Не удалось создать видео. Настройте Colab для настоящего AI видео.")
     setStage("error")
-    toast.error("Не удалось создать видео. Попробуйте ещё раз.")
+    toast.error("Не удалось создать видео. Настройте Colab для настоящего AI видео.")
   }, [imageDataUrl, imageFile, settings, history, persistHistory, colabStatus])
   const cancelGeneration = useCallback(() => {
     cancelRef.current = true
