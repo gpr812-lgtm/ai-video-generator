@@ -54,7 +54,7 @@ export async function POST(req: NextRequest) {
       withAudio: !!body.withAudio,
       size: body.size || '1280x720',
       fps: body.fps === 60 ? 60 : 30,
-      duration: body.duration === 10 ? 10 : 5,
+      duration: Math.min(body.duration || 5, 10), // ZAI max 10s per task
     })
 
     return NextResponse.json(result)

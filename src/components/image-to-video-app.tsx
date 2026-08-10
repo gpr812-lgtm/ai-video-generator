@@ -627,18 +627,13 @@ export default function ImageToVideoApp() {
               e.kind = 'rate_limited'
               throw e
             }
-            // Server tells us exactly how long to wait (retryAfterMs).
-            // Wait that long, then auto-fire the next attempt.
-            const waitMs = data.retryAfterMs || 600000
-            const waitSec = Math.max(5, Math.ceil(waitMs / 1000))
+            // Server tells us how long to wait. Default 30s (NOT 10 minutes).
+            const waitMs = data.retryAfterMs || 30000
+            const waitSec = Math.min(60, Math.max(10, Math.ceil(waitMs / 1000)))
             setStage('rate_limited')
             setRateLimitWait(waitSec)
             if (createAttempt === 1) {
-              const mins = Math.floor(waitSec / 60)
-              const secs = waitSec % 60
-              toast.error(
-                `ZAI лимит запросов. Автоповтор через ${mins}м ${secs}с — оставьте вкладку открытой.`,
-              )
+              toast.info(`ZAI занят. Повтор через ${waitSec}с…`)
             }
             for (let s = waitSec; s > 0; s--) {
               if (cancelRef.current) break
@@ -858,8 +853,10 @@ export default function ImageToVideoApp() {
     if (settings.duration > 10) {
       setStage('polling')
       setPollCount(1)
-      toast.info(`🎬 Чанковая генерация: ${settings.duration}с = ${Math.ceil(settings.duration / 5)} сегмента...`)
+      const numChunks = Math.ceil(settings.duration / 5)
+      toast.info(`🎬 Чанковая генерация: ${settings.duration}с = ${numChunks} сегментов...`)
       try {
+        // Step 1: Create chunked session (quick, returns sessionId)
         const { res, data } = await fetchJsonSafely('/api/video/chunked', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -872,47 +869,93 @@ export default function ImageToVideoApp() {
             quality: settings.quality,
           }),
         })
-        if (res.ok && data.videoUrl) {
-          setVideoUrl(data.videoUrl)
-          setStage('success')
-          toast.success(`Видео готово! (${data.chunks} сегментов, ${data.totalDuration}с)`)
 
-          // Update stats
-          const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + (data.totalDuration || settings.duration) }
-          setStats(newStats)
-          localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+        if (res.ok && data.sessionId) {
+          // Step 2: Poll session status until done
+          setStage('polling')
+          setPollCount(0)
+          let chunkVideoUrl: string | null = null
+          for (let poll = 0; poll < 120; poll++) { // 120 × 5s = 10 min max
+            if (cancelRef.current) break
+            setPollCount(poll + 1)
+            await new Promise((r) => setTimeout(r, 5000))
 
-          // Play voiceover
-          if (settings.withAudio && settings.voiceoverText.trim()) {
             try {
-              const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
-              const u = new SpeechSynthesisUtterance(settings.voiceoverText)
-              u.lang = voice.lang
-              u.pitch = voice.pitch
-              u.rate = voice.rate
-              const voices = window.speechSynthesis.getVoices()
-              const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
-              if (ruVoice) u.voice = ruVoice
-              window.speechSynthesis.speak(u)
-            } catch { /* ignore */ }
+              const { res: pollRes, data: pollData } = await fetchJsonSafely(
+                `/api/video/chunked?sessionId=${encodeURIComponent(data.sessionId)}`,
+              )
+              if (pollRes.ok) {
+                if (pollData.status === 'done' && pollData.videoUrl) {
+                  chunkVideoUrl = pollData.videoUrl
+                  break
+                }
+                if (pollData.status === 'error') {
+                  throw new Error(pollData.error || 'Chunked generation failed')
+                }
+                // Show progress
+                if (pollData.currentChunk > 0) {
+                  toast.info(`Сегмент ${pollData.currentChunk}/${pollData.totalChunks}...`)
+                }
+              }
+            } catch {
+              /* tolerate transient errors */
+            }
           }
 
-          // Save history
-          try {
-            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-            const item: HistoryItem = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              prompt: settings.prompt || '(chunked)',
-              imageUrl: thumb,
-              videoUrl: data.videoUrl,
-              createdAt: Date.now(),
-              thumb,
+          if (chunkVideoUrl) {
+            setVideoUrl(chunkVideoUrl)
+            setStage('success')
+            toast.success(`Видео готово! (${numChunks} сегментов, ${settings.duration}с)`)
+
+            // Update stats
+            const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+            setStats(newStats)
+            localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+            // Play voiceover
+            if (settings.withAudio) {
+              try {
+                window.speechSynthesis.cancel()
+                if (settings.dialogueMode) {
+                  settings.dialogue.forEach((line) => {
+                    if (!line.text.trim()) return
+                    const voice = VOICES.find((v) => v.id === line.voiceId) || VOICES[0]
+                    const u = new SpeechSynthesisUtterance(line.text)
+                    u.lang = voice.lang; u.pitch = voice.pitch; u.rate = voice.rate
+                    const voices = window.speechSynthesis.getVoices()
+                    const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+                    if (ruVoice) u.voice = ruVoice
+                    window.speechSynthesis.speak(u)
+                  })
+                } else if (settings.voiceoverText.trim()) {
+                  const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
+                  const u = new SpeechSynthesisUtterance(settings.voiceoverText)
+                  u.lang = voice.lang; u.pitch = voice.pitch; u.rate = voice.rate
+                  const voices = window.speechSynthesis.getVoices()
+                  const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
+                  if (ruVoice) u.voice = ruVoice
+                  window.speechSynthesis.speak(u)
+                }
+              } catch { /* ignore */ }
             }
-            const next = [item, ...history].slice(0, 12)
-            setHistory(next)
-            persistHistory(next)
-          } catch { /* ignore */ }
-          return
+
+            // Save history
+            try {
+              const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+              const item: HistoryItem = {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                prompt: settings.prompt || '(chunked)',
+                imageUrl: thumb,
+                videoUrl: chunkVideoUrl,
+                createdAt: Date.now(),
+                thumb,
+              }
+              const next = [item, ...history].slice(0, 12)
+              setHistory(next)
+              persistHistory(next)
+            } catch { /* ignore */ }
+            return
+          }
         }
         // Chunked failed — fall through to single ZAI
         toast.info('Чанковая генерация не удалась. Пробую обычную...')
@@ -1857,11 +1900,7 @@ export default function ImageToVideoApp() {
                   <span className="flex items-center gap-2">
                     <Loader2 className="h-4 w-4 animate-spin" />
                     {stage === 'rate_limited'
-                      ? (() => {
-                          const mins = Math.floor(rateLimitWait / 60)
-                          const secs = rateLimitWait % 60
-                          return `Ожидание ${mins}м ${secs.toString().padStart(2, '0')}с…`
-                        })()
+                      ? `Повтор через ${rateLimitWait}с…`
                       : stage === 'creating'
                         ? 'Подготовка задачи…'
                         : `Генерация… ${pollCount}/${MAX_POLLS}`}
@@ -2044,7 +2083,7 @@ export default function ImageToVideoApp() {
                         <p className="mt-1 text-xs text-white/50">
                           Автоматическая попытка через{' '}
                           <span className="font-semibold text-amber-300">
-                            {Math.floor(rateLimitWait / 60)}м {(rateLimitWait % 60).toString().padStart(2, '0')}с
+                            {rateLimitWait}с
                           </span>
                           …
                         </p>

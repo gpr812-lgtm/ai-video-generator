@@ -10,7 +10,7 @@ const FFMPEG_PATH = '/usr/bin/ffmpeg'
 function resolveFfmpeg(): string {
   const candidates = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/homebrew/bin/ffmpeg']
   for (const c of candidates) {
-    try { if (fs.existsSync(c)) return c } catch { /* try next */ }
+    try { if (fs.existsSync(c)) return c } catch {}
   }
   return 'ffmpeg'
 }

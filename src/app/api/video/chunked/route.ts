@@ -5,19 +5,36 @@ import fs from 'fs'
 import path from 'path'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300 // 5 min — chunked generation takes longer
+export const maxDuration = 25 // Quick — just creates the first chunk task
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface ChunkedBody {
-  imageUrl?: string // data URL
+  imageUrl?: string
   prompt?: string
   size?: string
   fps?: number
-  duration?: number // total desired duration (e.g. 30)
+  duration?: number
   quality?: 'speed' | 'quality'
-  withAudio?: boolean
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+// In-memory storage for chunked generation sessions
+interface ChunkSession {
+  id: string
+  totalChunks: number
+  currentChunk: number
+  videoUrls: string[]
+  status: 'creating' | 'processing' | 'stitching' | 'done' | 'error'
+  error?: string
+  finalVideoUrl?: string
+  imageBase64: string
+  prompt?: string
+  size?: string
+  fps?: number
+  quality?: string
+}
+
+const sessions = new Map<string, ChunkSession>()
 
 export async function POST(req: NextRequest) {
   try {
@@ -28,10 +45,10 @@ export async function POST(req: NextRequest) {
     }
 
     const totalDuration = body.duration || 5
-    const chunkSize = 5 // ZAI max per task is 5-10s, use 5 for reliability
+    const chunkSize = 5
     const numChunks = Math.ceil(totalDuration / chunkSize)
 
-    // Parse image base64 from data URL
+    // Parse image base64
     let imageBase64: string
     if (body.imageUrl.startsWith('data:')) {
       const idx = body.imageUrl.indexOf(',')
@@ -40,106 +57,148 @@ export async function POST(req: NextRequest) {
       imageBase64 = body.imageUrl
     }
 
-    console.log(`[chunked] generating ${numChunks} chunks of ${chunkSize}s each (total ${totalDuration}s)`)
+    // Create session
+    const sessionId = `chunk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const session: ChunkSession = {
+      id: sessionId,
+      totalChunks: numChunks,
+      currentChunk: 0,
+      videoUrls: [],
+      status: 'creating',
+      imageBase64,
+      prompt: body.prompt,
+      size: body.size || '1280x720',
+      fps: body.fps || 30,
+      quality: body.quality || 'speed',
+    }
+    sessions.set(sessionId, session)
 
-    const videoUrls: string[] = []
-    const errors: string[] = []
+    // Start background generation (doesn't block the response)
+    generateChunksInBackground(sessionId).catch((err) => {
+      console.error(`[chunked] background error:`, err)
+      session.status = 'error'
+      session.error = err instanceof Error ? err.message : 'Unknown error'
+    })
 
-    // Generate each chunk sequentially (ZAI has rate limit)
-    for (let i = 0; i < numChunks; i++) {
-      console.log(`[chunked] chunk ${i + 1}/${numChunks}`)
+    // Return immediately with session ID
+    return NextResponse.json({
+      sessionId,
+      totalChunks: numChunks,
+      totalDuration,
+      status: 'creating',
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Chunked generation failed'
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
+}
 
-      // Vary prompt slightly for each chunk to create motion progression
-      const chunkPrompt = body.prompt
-        ? `${body.prompt}, part ${i + 1} of ${numChunks}, continuous motion`
-        : `cinematic scene, part ${i + 1} of ${numChunks}, continuous motion`
+// GET — poll session status
+export async function GET(req: NextRequest) {
+  const sessionId = req.nextUrl.searchParams.get('sessionId')
+  if (!sessionId) {
+    return NextResponse.json({ error: 'sessionId required' }, { status: 400 })
+  }
+  const session = sessions.get(sessionId)
+  if (!session) {
+    return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+  }
+  return NextResponse.json({
+    sessionId,
+    status: session.status,
+    currentChunk: session.currentChunk,
+    totalChunks: session.totalChunks,
+    videoUrl: session.finalVideoUrl,
+    error: session.error,
+  })
+}
 
-      let taskId: string | null = null
+// Background chunk generation
+async function generateChunksInBackground(sessionId: string) {
+  const session = sessions.get(sessionId)
+  if (!session) return
 
-      // Try to create task — if rate limited, wait and retry
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const result = await createVideoTask({
-            prompt: chunkPrompt,
-            imageUrl: imageBase64,
-            quality: body.quality || 'speed',
-            withAudio: false,
-            size: body.size || '1280x720',
-            fps: body.fps || 30,
-            duration: chunkSize,
-          })
-          taskId = result.taskId
-          break
-        } catch (err) {
-          if (err instanceof ZaiRateLimitError) {
-            console.log(`[chunked] chunk ${i + 1} rate limited, waiting 60s...`)
-            await sleep(60000) // Wait 60s before retry
-          } else {
-            throw err
-          }
+  for (let i = 0; i < session.totalChunks; i++) {
+    session.currentChunk = i + 1
+    session.status = 'processing'
+
+    const chunkPrompt = session.prompt
+      ? `${session.prompt}, part ${i + 1} of ${session.totalChunks}, continuous motion`
+      : `cinematic scene, part ${i + 1} of ${session.totalChunks}, continuous motion`
+
+    // Create ZAI task for this chunk
+    let taskId: string | null = null
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const result = await createVideoTask({
+          prompt: chunkPrompt,
+          imageUrl: session.imageBase64,
+          quality: (session.quality as 'speed' | 'quality') || 'speed',
+          withAudio: false,
+          size: session.size || '1280x720',
+          fps: session.fps || 30,
+          duration: 5,
+        })
+        taskId = result.taskId
+        break
+      } catch (err) {
+        if (err instanceof ZaiRateLimitError) {
+          console.log(`[chunked] chunk ${i + 1} rate limited, waiting 30s...`)
+          await sleep(30000)
+        } else {
+          throw err
         }
-      }
-
-      if (!taskId) {
-        errors.push(`Chunk ${i + 1}: не удалось создать задачу`)
-        continue
-      }
-
-      // Poll for completion
-      let videoUrl: string | null = null
-      for (let poll = 0; poll < 30; poll++) {
-        await sleep(5000)
-        const status = await queryVideoStatus(taskId)
-        if (status.status === 'SUCCESS' && status.videoUrl) {
-          videoUrl = status.videoUrl
-          break
-        }
-        if (status.status === 'FAIL') {
-          errors.push(`Chunk ${i + 1}: ${status.errorMessage || 'FAIL'}`)
-          break
-        }
-      }
-
-      if (videoUrl) {
-        videoUrls.push(videoUrl)
-        console.log(`[chunked] chunk ${i + 1} done: ${videoUrl}`)
       }
     }
 
-    if (videoUrls.length === 0) {
-      return NextResponse.json(
-        { error: `Не удалось сгенерировать ни одного сегмента. ${errors.join('; ')}` },
-        { status: 502 },
-      )
+    if (!taskId) {
+      throw new Error(`Chunk ${i + 1}: failed to create task`)
     }
 
-    // If only one chunk, return it directly
-    if (videoUrls.length === 1) {
-      return NextResponse.json({
-        videoUrl: videoUrls[0],
-        provider: 'zai-chunked',
-        chunks: 1,
-        totalDuration: chunkSize,
-      })
+    // Poll for completion
+    let videoUrl: string | null = null
+    for (let poll = 0; poll < 30; poll++) {
+      await sleep(5000)
+      const status = await queryVideoStatus(taskId)
+      if (status.status === 'SUCCESS' && status.videoUrl) {
+        videoUrl = status.videoUrl
+        break
+      }
+      if (status.status === 'FAIL') {
+        throw new Error(`Chunk ${i + 1}: ${status.errorMessage || 'FAIL'}`)
+      }
     }
 
-    // Stitch all chunks into one video
+    if (videoUrl) {
+      session.videoUrls.push(videoUrl)
+      console.log(`[chunked] chunk ${i + 1}/${session.totalChunks} done`)
+    }
+  }
+
+  // Stitch all chunks
+  if (session.videoUrls.length > 0) {
+    session.status = 'stitching'
     const uploadsDir = path.join(process.cwd(), 'public', 'uploads')
     await fs.promises.mkdir(uploadsDir, { recursive: true })
     const outputPath = path.join(uploadsDir, `chunked-${Date.now()}.mp4`)
 
-    await stitchVideos(videoUrls, outputPath)
+    if (session.videoUrls.length === 1) {
+      // Single chunk — just download
+      const res = await fetch(session.videoUrls[0])
+      const buf = Buffer.from(await res.arrayBuffer())
+      await fs.promises.writeFile(outputPath, buf)
+    } else {
+      await stitchVideos(session.videoUrls, outputPath)
+    }
 
-    return NextResponse.json({
-      videoUrl: `/uploads/${path.basename(outputPath)}`,
-      provider: 'zai-chunked',
-      chunks: videoUrls.length,
-      totalDuration: videoUrls.length * chunkSize,
-      errors: errors.length > 0 ? errors : undefined,
-    })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Chunked generation failed'
-    console.error('[chunked] error:', err)
-    return NextResponse.json({ error: message }, { status: 500 })
+    session.finalVideoUrl = `/uploads/${path.basename(outputPath)}`
+    session.status = 'done'
+    console.log(`[chunked] session ${sessionId} complete: ${session.finalVideoUrl}`)
+  } else {
+    session.status = 'error'
+    session.error = 'No chunks were generated'
   }
+
+  // Clean up session after 10 minutes
+  setTimeout(() => sessions.delete(sessionId), 10 * 60 * 1000)
 }
