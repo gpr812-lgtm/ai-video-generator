@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
     if (err instanceof ZaiRateLimitError) {
       return NextResponse.json(
         {
-          error: 'ZAI лимит: 1 запрос в 10 минут. Подождите и попробуйте снова.',
+          error: 'ZAI занят. Повтор через 30 секунд...',
           retryAfterMs: err.retryAfterMs,
           retryable: true,
         },

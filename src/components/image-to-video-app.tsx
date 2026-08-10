@@ -796,6 +796,33 @@ export default function ImageToVideoApp() {
       return
     }
 
+    // ===== STEP 0: Enhance prompt using ZAI Vision =====
+    // Analyze the image and create a detailed cinematic prompt
+    // This helps ZAI understand transformations (e.g. car→robot)
+    let enhancedPrompt = settings.prompt
+    if (settings.prompt.trim()) {
+      setStage('creating')
+      toast.info('🔍 Анализирую изображение для лучшего промпта...')
+      try {
+        const { res: analyzeRes, data: analyzeData } = await fetchJsonSafely('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageUrl: resizedDataUrl,
+            userPrompt: settings.prompt,
+          }),
+        })
+        if (analyzeRes.ok && analyzeData.enhancedPrompt) {
+          enhancedPrompt = analyzeData.enhancedPrompt
+          toast.success('Промпт улучшен!')
+          console.log('[generate] enhanced prompt:', enhancedPrompt.slice(0, 100))
+        }
+      } catch {
+        // If analysis fails, use original prompt
+        console.warn('[generate] prompt enhancement failed, using original')
+      }
+    }
+
     // ===== DUAL AI MODE: Colab SVD + ZAI cogvideox-3 =====
     // Two real AI providers:
     //   1. Google Colab (SVD) — if configured, no limits, best quality
@@ -814,7 +841,7 @@ export default function ImageToVideoApp() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             imageBase64: resizedDataUrl.split(',')[1],
-            prompt: settings.prompt,
+            prompt: enhancedPrompt,
             provider: 'colab',
           }),
         })
@@ -862,7 +889,7 @@ export default function ImageToVideoApp() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             imageUrl: resizedDataUrl,
-            prompt: settings.prompt,
+            prompt: enhancedPrompt,
             size: settings.size,
             fps: settings.fps,
             duration: settings.duration,
@@ -975,7 +1002,7 @@ export default function ImageToVideoApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: settings.prompt,
+          prompt: enhancedPrompt,
           imageUrl: resizedDataUrl,
           quality: settings.quality,
           withAudio: settings.withAudio,
@@ -1003,7 +1030,7 @@ export default function ImageToVideoApp() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              prompt: settings.prompt,
+              prompt: enhancedPrompt,
               imageUrl: resizedDataUrl,
               quality: settings.quality,
               withAudio: settings.withAudio,
@@ -1086,37 +1113,48 @@ export default function ImageToVideoApp() {
     setStats(newStats)
     localStorage.setItem('i2v_stats', JSON.stringify(newStats))
 
-    // Play Russian voiceover if enabled
+    // Play Russian voiceover using ZAI TTS (natural voices, not robotic)
     if (settings.withAudio) {
       try {
-        window.speechSynthesis.cancel()
+        toast.info('🔊 Создаю естественную озвучку через ZAI TTS...')
+        const textsToSpeak: string[] = []
         if (settings.dialogueMode) {
-          // Multi-voice dialogue: each line with its own voice, sequentially
           settings.dialogue.forEach((line) => {
-            if (!line.text.trim()) return
-            const voice = VOICES.find((v) => v.id === line.voiceId) || VOICES[0]
-            const u = new SpeechSynthesisUtterance(line.text)
-            u.lang = voice.lang
-            u.pitch = voice.pitch
-            u.rate = voice.rate
-            const voices = window.speechSynthesis.getVoices()
-            const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
-            if (ruVoice) u.voice = ruVoice
-            window.speechSynthesis.speak(u)
+            if (line.text.trim()) textsToSpeak.push(line.text.trim())
           })
-          toast.info('🔊 Многоголосная озвучка воспроизводится...')
         } else if (settings.voiceoverText.trim()) {
-          const voice = VOICES.find((v) => v.id === settings.voiceId) || VOICES[0]
-          const utterance = new SpeechSynthesisUtterance(settings.voiceoverText)
-          utterance.lang = voice.lang
-          utterance.pitch = voice.pitch
-          utterance.rate = voice.rate
-          const voices = window.speechSynthesis.getVoices()
-          const ruVoice = voices.find((v) => v.lang.startsWith('ru'))
-          if (ruVoice) utterance.voice = ruVoice
-          window.speechSynthesis.speak(utterance)
-          toast.info(`🔊 Озвучка: ${voice.name}`)
+          textsToSpeak.push(settings.voiceoverText.trim())
         }
+
+        // Generate TTS audio via ZAI API
+        for (const text of textsToSpeak) {
+          try {
+            const ttsRes = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, voice: 'tongtong' }),
+            })
+            if (ttsRes.ok) {
+              const ttsData = await ttsRes.json()
+              if (ttsData.audioUrl) {
+                // Play the natural TTS audio
+                const audio = new Audio(ttsData.audioUrl)
+                audio.play()
+                // Wait for audio to finish before next line
+                await new Promise((r) => {
+                  audio.onended = r
+                  audio.onerror = r
+                })
+              }
+            }
+          } catch {
+            // Fallback to browser TTS if ZAI TTS fails
+            const u = new SpeechSynthesisUtterance(text)
+            u.lang = 'ru-RU'
+            window.speechSynthesis.speak(u)
+          }
+        }
+        toast.success('🔊 Озвучка воспроизведена')
       } catch {
         toast.error('Не удалось воспроизвести озвучку')
       }
@@ -1823,8 +1861,8 @@ export default function ImageToVideoApp() {
                     </div>
                     <p className="mt-2 text-[11px] text-white/40">
                       {settings.dialogueMode
-                        ? 'Каждая реплика озвучивается выбранным голосом по очереди'
-                        : 'Озвучка воспроизводится через браузерное TTS (бесплатно)'}
+                        ? 'Каждая реплика озвучивается естественным голосом через ZAI TTS'
+                        : 'Естественная озвучка через ZAI TTS (не робот!)'}
                     </p>
                   </div>
                 )}
