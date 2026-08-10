@@ -192,6 +192,107 @@ async function fetchJsonSafely(
   return { res, data }
 }
 
+/**
+ * Generate a Ken Burns video entirely in the browser using Canvas + MediaRecorder.
+ * No server request needed — works even when the gateway returns 502.
+ * Creates a smooth zoom/pan animation from a static image.
+ */
+async function generateClientSideVideo(
+  imageDataUrl: string,
+  duration: number,
+  prompt: string,
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const img = new window.Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      const W = 640
+      const H = 360
+      canvas.width = W
+      canvas.height = H
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Canvas not supported'))
+        return
+      }
+
+      // Determine motion type from prompt
+      const p = prompt.toLowerCase()
+      let zoomDir = 1 // 1 = zoom in, -1 = zoom out
+      let panX = 0, panY = 0
+      if (p.includes('zoom out') || p.includes('отда')) zoomDir = -1
+      if (p.includes('pan right') || p.includes('вправ')) panX = 1
+      if (p.includes('pan left') || p.includes('влев')) panX = -1
+
+      // Setup MediaRecorder
+      const stream = canvas.captureStream(25) // 25 fps
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+          ? 'video/webm;codecs=vp8'
+          : 'video/webm'
+
+      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2000000 })
+      const chunks: Blob[] = []
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data)
+      }
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'video/webm' })
+        resolve(blob)
+      }
+      recorder.onerror = (e) => reject(new Error('Recorder error'))
+
+      recorder.start()
+
+      // Animate
+      const totalFrames = duration * 25
+      let frame = 0
+      const startZoom = zoomDir > 0 ? 1.0 : 1.2
+      const endZoom = zoomDir > 0 ? 1.2 : 1.0
+
+      function drawFrame() {
+        if (frame >= totalFrames) {
+          recorder.stop()
+          return
+        }
+
+        const progress = frame / totalFrames
+        const zoom = startZoom + (endZoom - startZoom) * progress
+        const offsetX = panX * progress * 50
+        const offsetY = 0
+
+        // Draw image with zoom/pan
+        ctx.fillStyle = '#000'
+        ctx.fillRect(0, 0, W, H)
+
+        const imgAspect = img.width / img.height
+        const canvasAspect = W / H
+        let drawW, drawH
+        if (imgAspect > canvasAspect) {
+          drawH = H * zoom
+          drawW = drawH * imgAspect
+        } else {
+          drawW = W * zoom
+          drawH = drawW / imgAspect
+        }
+        const x = (W - drawW) / 2 + offsetX
+        const y = (H - drawH) / 2 + offsetY
+
+        ctx.drawImage(img, x, y, drawW, drawH)
+
+        frame++
+        requestAnimationFrame(drawFrame)
+      }
+
+      drawFrame()
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = imageDataUrl
+  })
+}
+
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -1013,53 +1114,45 @@ export default function ImageToVideoApp() {
       })
 
       if (res.status === 429 && data?.retryable) {
-        // ZAI is rate-limited. Instead of waiting, IMMEDIATELY generate
-        // via local ffmpeg (Ken Burns effect) so the user gets a video NOW.
-        // They can retry ZAI later when the rate limit resets.
-        toast.info('ZAI занят. Создаю превью через ffmpeg (мгновенно)...')
+        // ZAI is rate-limited. Generate video CLIENT-SIDE using Canvas API.
+        // No server request = no 502 = ALWAYS works.
+        toast.info('ZAI занят. Создаю превью в браузере (мгновенно)...')
         setStage('creating')
+
         try {
-          const { res: ffmpegRes, data: ffmpegData } = await fetchJsonSafely('/api/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              imageBase64: resizedDataUrl.split(',')[1],
-              prompt: enhancedPrompt,
-              provider: 'local',
-              duration: settings.duration,
-            }),
-          })
-          if (ffmpegRes.ok && ffmpegData.videoUrl) {
-            setVideoUrl(ffmpegData.videoUrl)
-            setStage('success')
-            toast.success('Превью готово! (ffmpeg) Для AI-качества попробуйте позже — ZAI освободится.')
+          // Client-side Ken Burns video generation using Canvas + MediaRecorder
+          const videoBlob = await generateClientSideVideo(resizedDataUrl, settings.duration, enhancedPrompt)
+          const videoObjectUrl = URL.createObjectURL(videoBlob)
 
-            // Update stats
-            const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
-            setStats(newStats)
-            localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+          setVideoUrl(videoObjectUrl)
+          setStage('success')
+          toast.success('Превью готово! Для AI-качества попробуйте позже.')
 
-            // Save history
-            try {
-              const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-              const item: HistoryItem = {
-                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                prompt: settings.prompt || '(ffmpeg preview)',
-                imageUrl: thumb,
-                videoUrl: ffmpegData.videoUrl,
-                createdAt: Date.now(),
-                thumb,
-              }
-              const next = [item, ...history].slice(0, 12)
-              setHistory(next)
-              persistHistory(next)
-            } catch { /* ignore */ }
-            return
-          }
-        } catch {
-          // ffmpeg also failed — show error with retry option
+          // Update stats
+          const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+          setStats(newStats)
+          localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+          // Save history
+          try {
+            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+            const item: HistoryItem = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              prompt: settings.prompt || '(browser preview)',
+              imageUrl: thumb,
+              videoUrl: videoObjectUrl,
+              createdAt: Date.now(),
+              thumb,
+            }
+            const next = [item, ...history].slice(0, 12)
+            setHistory(next)
+            persistHistory(next)
+          } catch { /* ignore */ }
+          return
+        } catch (ffmpegErr) {
+          console.error('[generate] client-side video failed:', ffmpegErr)
+          throw new Error('Не удалось создать видео. Попробуйте ещё раз.')
         }
-        throw new Error('ZAI занят. Попробуйте через несколько минут или используйте Colab.')
       } else if (!res.ok) {
         throw new Error(data?.error || 'Не удалось создать задачу')
       } else {
