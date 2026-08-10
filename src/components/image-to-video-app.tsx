@@ -930,14 +930,113 @@ export default function ImageToVideoApp() {
       }
     }
 
-    // ===== DUAL AI MODE: Colab SVD + ZAI cogvideox-3 =====
-    // Two real AI providers:
-    //   1. Google Colab (SVD) — if configured, no limits, best quality
-    //   2. ZAI (cogvideox-3) — free, but 1 req / 10 min rate limit
-    // If Colab is configured, try it first. If it fails, fall back to ZAI.
-    // If ZAI is rate-limited, show countdown and wait.
+    // ===== PRIMARY: AI Video via ZAI Image API (NO LIMITS!) =====
+    // Generates 10 AI frames → stitches into video.
+    // Uses ZAI Image API (30 req/10min) instead of Video API (1 req/10min).
+    // Each frame is REAL AI-generated content.
+    {
+      setStage('polling')
+      setPollCount(0)
+      toast.info('🎨 Генерирую AI-кадры через нейросеть...')
 
-    // Step 1: Try Colab if configured
+      try {
+        // Create session (quick)
+        const aiVideoRes = await fetch('/api/ai-video', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: enhancedPrompt,
+            duration: settings.duration,
+          }),
+        })
+        const aiVideoData = await aiVideoRes.json()
+
+        if (aiVideoRes.ok && aiVideoData.sessionId) {
+          // Poll for progress
+          let aiVideoUrl: string | null = null
+          for (let poll = 0; poll < 120; poll++) {
+            if (cancelRef.current) break
+            setPollCount(poll + 1)
+            await new Promise((r) => setTimeout(r, 5000))
+
+            try {
+              const pollRes = await fetch(`/api/ai-video?sessionId=${encodeURIComponent(aiVideoData.sessionId)}`)
+              if (pollRes.ok) {
+                const pollData = await pollRes.json()
+                if (pollData.status === 'done' && pollData.videoUrl) {
+                  aiVideoUrl = pollData.videoUrl
+                  break
+                }
+                if (pollData.status === 'error') {
+                  throw new Error(pollData.error || 'AI generation failed')
+                }
+                // Show progress
+                if (pollData.framesDone > 0) {
+                  setPollCount(pollData.framesDone)
+                  toast.info(`AI-кадр ${pollData.framesDone}/${pollData.framesTotal}...`)
+                }
+              }
+            } catch { /* tolerate */ }
+          }
+
+          if (aiVideoUrl) {
+            setVideoUrl(aiVideoUrl)
+            setStage('success')
+            toast.success('AI видео готово! (10 нейросетевых кадров)')
+
+            // Update stats
+            const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+            setStats(newStats)
+            localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+            // Play voiceover
+            if (settings.withAudio) {
+              try {
+                toast.info('🔊 Создаю озвучку через ZAI TTS...')
+                const textsToSpeak: string[] = []
+                if (settings.dialogueMode) {
+                  settings.dialogue.forEach((line) => { if (line.text.trim()) textsToSpeak.push(line.text.trim()) })
+                } else if (settings.voiceoverText.trim()) {
+                  textsToSpeak.push(settings.voiceoverText.trim())
+                }
+                for (const text of textsToSpeak) {
+                  try {
+                    const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
+                    if (ttsRes.ok) {
+                      const ttsData = await ttsRes.json()
+                      if (ttsData.audioUrl) {
+                        const audio = new Audio(ttsData.audioUrl)
+                        audio.play()
+                        await new Promise((r) => { audio.onended = r; audio.onerror = r })
+                      }
+                    }
+                  } catch {
+                    const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u)
+                  }
+                }
+              } catch { /* ignore */ }
+            }
+
+            // Save history
+            try {
+              const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+              const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(AI frames)', imageUrl: thumb, videoUrl: aiVideoUrl, createdAt: Date.now(), thumb }
+              const next = [item, ...history].slice(0, 12)
+              setHistory(next)
+              persistHistory(next)
+            } catch { /* ignore */ }
+            return
+          }
+        }
+        // AI video failed — fall through to ZAI video API
+        toast.info('AI-кадры не сработали. Пробую ZAI Video API...')
+      } catch (err) {
+        console.warn('[generate] AI video failed, trying ZAI video:', err)
+        toast.info('Пробую ZAI Video API...')
+      }
+    }
+
+    // ===== FALLBACK: ZAI Video API (1 req / 10 min) =====    // Step 1: Try Colab if configured
     if (colabStatus?.connected && resizedDataUrl) {
       setStage('polling')
       setPollCount(1)
