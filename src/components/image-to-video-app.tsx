@@ -1013,35 +1013,53 @@ export default function ImageToVideoApp() {
       })
 
       if (res.status === 429 && data?.retryable) {
-        // ZAI returned 429 — retry in 30 seconds (NOT 10 minutes!)
-        const waitSec = 30
-        setStage('rate_limited')
-        setRateLimitWait(waitSec)
-        toast.info(`ZAI занят. Повтор через 30с…`)
-        for (let s = waitSec; s > 0; s--) {
-          if (cancelRef.current) break
-          setRateLimitWait(s)
-          await new Promise((r) => setTimeout(r, 1000))
-        }
-        setRateLimitWait(0)
-        if (!cancelRef.current) {
-          setStage('creating')
-          const { res: res2, data: data2 } = await fetchJsonSafely('/api/video/create', {
+        // ZAI is rate-limited. Instead of waiting, IMMEDIATELY generate
+        // via local ffmpeg (Ken Burns effect) so the user gets a video NOW.
+        // They can retry ZAI later when the rate limit resets.
+        toast.info('ZAI занят. Создаю превью через ffmpeg (мгновенно)...')
+        setStage('creating')
+        try {
+          const { res: ffmpegRes, data: ffmpegData } = await fetchJsonSafely('/api/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              imageBase64: resizedDataUrl.split(',')[1],
               prompt: enhancedPrompt,
-              imageUrl: resizedDataUrl,
-              quality: settings.quality,
-              withAudio: settings.withAudio,
-              size: settings.size,
-              fps: settings.fps,
+              provider: 'local',
               duration: settings.duration,
             }),
           })
-          if (!res2.ok) throw new Error(data2?.error || 'Не удалось создать задачу')
-          taskId = data2.taskId
+          if (ffmpegRes.ok && ffmpegData.videoUrl) {
+            setVideoUrl(ffmpegData.videoUrl)
+            setStage('success')
+            toast.success('Превью готово! (ffmpeg) Для AI-качества попробуйте позже — ZAI освободится.')
+
+            // Update stats
+            const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+            setStats(newStats)
+            localStorage.setItem('i2v_stats', JSON.stringify(newStats))
+
+            // Save history
+            try {
+              const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+              const item: HistoryItem = {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                prompt: settings.prompt || '(ffmpeg preview)',
+                imageUrl: thumb,
+                videoUrl: ffmpegData.videoUrl,
+                createdAt: Date.now(),
+                thumb,
+              }
+              const next = [item, ...history].slice(0, 12)
+              setHistory(next)
+              persistHistory(next)
+            } catch { /* ignore */ }
+            return
+          }
+        } catch {
+          // ffmpeg also failed — show error with retry option
         }
+        throw new Error('ZAI занят. Попробуйте через несколько минут или используйте Colab.')
       } else if (!res.ok) {
         throw new Error(data?.error || 'Не удалось создать задачу')
       } else {
