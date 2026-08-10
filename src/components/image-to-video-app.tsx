@@ -1120,44 +1120,49 @@ export default function ImageToVideoApp() {
       })
 
       if (res.status === 429 && data?.retryable) {
-        // ZAI is rate-limited. Generate video CLIENT-SIDE using Canvas API.
-        // No server request = no 502 = ALWAYS works.
-        toast.info('ZAI занят. Создаю превью в браузере (мгновенно)...')
-        setStage('creating')
+        // ZAI is rate-limited. KEEP RETRYING until ZAI accepts.
+        // NO fallback to ffmpeg/Canvas — user wants REAL AI video.
+        const maxRetries = 30 // 30 × 30s = 15 min max
+        for (let retry = 0; retry < maxRetries; retry++) {
+          if (cancelRef.current) break
+          const waitSec = 30
+          setStage('rate_limited')
+          setRateLimitWait(waitSec)
+          if (retry === 0) {
+            toast.info('ZAI занят. Ожидаю освобождения для AI-генерации...')
+          }
+          for (let s = waitSec; s > 0; s--) {
+            if (cancelRef.current) break
+            setRateLimitWait(s)
+            await new Promise((r) => setTimeout(r, 1000))
+          }
+          setRateLimitWait(0)
+          if (cancelRef.current) break
 
-        try {
-          // Client-side Ken Burns video generation using Canvas + MediaRecorder
-          const videoBlob = await generateClientSideVideo(resizedDataUrl, settings.duration, enhancedPrompt)
-          const videoObjectUrl = URL.createObjectURL(videoBlob)
-
-          setVideoUrl(videoObjectUrl)
-          setStage('success')
-          toast.success('Превью готово! Для AI-качества попробуйте позже.')
-
-          // Update stats
-          const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
-          setStats(newStats)
-          localStorage.setItem('i2v_stats', JSON.stringify(newStats))
-
-          // Save history
-          try {
-            const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-            const item: HistoryItem = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              prompt: settings.prompt || '(browser preview)',
-              imageUrl: thumb,
-              videoUrl: videoObjectUrl,
-              createdAt: Date.now(),
-              thumb,
-            }
-            const next = [item, ...history].slice(0, 12)
-            setHistory(next)
-            persistHistory(next)
-          } catch { /* ignore */ }
-          return
-        } catch (ffmpegErr) {
-          console.error('[generate] client-side video failed:', ffmpegErr)
-          throw new Error('Не удалось создать видео. Попробуйте ещё раз.')
+          // Retry
+          setStage('creating')
+          const { res: retryRes, data: retryData } = await fetchJsonSafely('/api/video/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: enhancedPrompt,
+              imageUrl: resizedDataUrl,
+              quality: settings.quality,
+              withAudio: settings.withAudio,
+              size: settings.size,
+              fps: settings.fps,
+              duration: settings.duration,
+            }),
+          })
+          if (retryRes.ok && retryData.taskId) {
+            taskId = retryData.taskId
+            toast.success('ZAI принял запрос! Генерирую AI видео...')
+            break
+          }
+          // Still 429 — keep waiting
+        }
+        if (!taskId) {
+          throw new Error('ZAI долго не отвечает. Попробуйте позже.')
         }
       } else if (!res.ok) {
         throw new Error(data?.error || 'Не удалось создать задачу')
