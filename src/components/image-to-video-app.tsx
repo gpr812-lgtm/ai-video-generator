@@ -898,29 +898,35 @@ export default function ImageToVideoApp() {
     }
 
     // ===== STEP 0: Enhance prompt using ZAI Vision =====
-    // Analyze the image and create a detailed cinematic prompt
-    // This helps ZAI understand transformations (e.g. car→robot)
+    // Quick analysis (5-10s). If it fails, use original prompt.
     let enhancedPrompt = settings.prompt
     if (settings.prompt.trim()) {
       setStage('creating')
-      toast.info('🔍 Анализирую изображение для лучшего промпта...')
+      toast.info('🔍 Анализирую изображение...')
       try {
-        const { res: analyzeRes, data: analyzeData } = await fetchJsonSafely('/api/analyze', {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 15000) // 15s max
+        const analyzeRes = await fetch('/api/analyze', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             imageUrl: resizedDataUrl,
             userPrompt: settings.prompt,
           }),
+          signal: controller.signal,
         })
-        if (analyzeRes.ok && analyzeData.enhancedPrompt) {
-          enhancedPrompt = analyzeData.enhancedPrompt
-          toast.success('Промпт улучшен!')
-          console.log('[generate] enhanced prompt:', enhancedPrompt.slice(0, 100))
+        clearTimeout(timeout)
+
+        if (analyzeRes.ok) {
+          const analyzeData = await analyzeRes.json()
+          if (analyzeData.enhancedPrompt && analyzeData.enhancedPrompt.length > 20) {
+            enhancedPrompt = analyzeData.enhancedPrompt
+            toast.success('Промпт улучшен ИИ!')
+          }
         }
       } catch {
-        // If analysis fails, use original prompt
-        console.warn('[generate] prompt enhancement failed, using original')
+        // If analyze fails (timeout, 500, etc.), use original prompt
+        console.warn('[generate] analyze failed, using original prompt')
       }
     }
 

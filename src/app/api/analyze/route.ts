@@ -2,17 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import ZAI from 'z-ai-web-dev-sdk'
 
 export const runtime = 'nodejs'
-export const maxDuration = 30
+export const maxDuration = 20 // Short — gateway times out at ~30s
 
 /**
- * Analyze image using ZAI Vision API and generate a detailed video prompt.
- * This helps ZAI cogvideox-3 understand what transformation to animate.
- *
- * Example: user uploads a car photo + prompt "transform into robot"
- * → Vision analyzes: "a red sports car parked on a street"
- * → Generated prompt: "a red sports car parked on a street, the car begins
- *   to transform, metal panels shift and fold, mechanical arms extend,
- *   the car morphs into a giant robot standing upright, cinematic transformation"
+ * Analyze image using ZAI Vision API and generate a SHORT video prompt.
+ * Returns a prompt under 500 chars (ZAI cogvideox-3 limit).
  */
 
 export async function POST(req: NextRequest) {
@@ -26,19 +20,16 @@ export async function POST(req: NextRequest) {
 
     const zai = await ZAI.create()
 
-    // Use ZAI Vision to analyze the image and generate a detailed video prompt
-    const systemPrompt = `Ты — эксперт по созданию промптов для AI видео-генерации.
-Проанализируй изображение и создай детальный промпт на АНГЛИЙСКОМ ЯЗЫКЕ для генерации видео.
+    // Short, focused system prompt — generates SHORT output
+    const systemPrompt = `Analyze the image and create a SHORT video generation prompt in English (max 80 words).
+Rules:
+- Describe what you see (objects, colors, scene)
+- If user wants transformation, describe it step-by-step
+- Include camera movement and lighting
+- Be concise and cinematic
+- Output ONLY the prompt, no explanations`
 
-Правила:
-1. Опиши, что видишь на изображении (объекты, цвета, фон, освещение)
-2. Если пользователь хочет трансформацию — опиши её ПОШАГОВО, плавно
-3. Промпт должен быть кинематографичным: движение камеры, освещение, атмосфера
-4. Не более 100 слов
-5. Фокус на плавном движении и трансформации`
-
-    const userMessage = `Опиши изображение и создай промпт для видео.
-Пожелание пользователя: ${userPrompt || 'просто оживи сцену'}`
+    const userMessage = `User request: ${userPrompt || 'animate this scene'}`
 
     const completion = await zai.chat.completions.createVision({
       model: 'glm-4v',
@@ -54,7 +45,20 @@ export async function POST(req: NextRequest) {
       thinking: { type: 'disabled' },
     })
 
-    const enhancedPrompt = completion.choices[0]?.message?.content || userPrompt || ''
+    let enhancedPrompt = completion.choices[0]?.message?.content || userPrompt || ''
+
+    // Clean up: remove markdown, headers, extra whitespace
+    enhancedPrompt = enhancedPrompt
+      .replace(/^#+\s*/gm, '') // remove markdown headers
+      .replace(/^\*\*.*\*\*:?\s*/gm, '') // remove bold headers
+      .replace(/^>\s*/gm, '') // remove blockquotes
+      .replace(/\n{3,}/g, '\n\n') // collapse multiple newlines
+      .trim()
+
+    // Truncate to 500 chars (ZAI cogvideox-3 limit)
+    if (enhancedPrompt.length > 500) {
+      enhancedPrompt = enhancedPrompt.slice(0, 497) + '...'
+    }
 
     return NextResponse.json({
       enhancedPrompt,
@@ -62,7 +66,12 @@ export async function POST(req: NextRequest) {
     })
   } catch (err) {
     console.error('[analyze] error:', err)
-    const message = err instanceof Error ? err.message : 'Analysis failed'
-    return NextResponse.json({ error: message }, { status: 500 })
+    // Return original prompt instead of failing
+    const body = await req.json().catch(() => ({}))
+    return NextResponse.json({
+      enhancedPrompt: body.userPrompt || '',
+      originalPrompt: body.userPrompt || '',
+      error: 'Анализ недоступен, используется оригинальный промпт',
+    })
   }
 }
