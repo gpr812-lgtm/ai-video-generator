@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import ZAI from 'z-ai-web-dev-sdk'
 import fs from 'fs'
 import path from 'path'
 import { exec } from 'child_process'
@@ -13,9 +12,11 @@ export const runtime = 'nodejs'
 export const maxDuration = 25
 
 /**
- * AI Video Generator using ZAI Image API (30 req/10min).
- * Async: POST creates session, GET polls status.
- * Generates 10 AI frames → stitches into video.
+ * Standalone AI Video Generator — NO ZAI, NO API keys, NO limits.
+ * Uses Pollinations.ai (free, open-source, Flux model) to generate
+ * 10 AI frames, then stitches them into a video with ffmpeg.
+ *
+ * This is 100% free and works without any configuration.
  */
 
 interface Session {
@@ -35,26 +36,18 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
     const { prompt, duration } = body as { prompt: string; duration?: number }
+    if (!prompt) return NextResponse.json({ error: 'Промпт обязателен' }, { status: 400 })
 
-    if (!prompt) {
-      return NextResponse.json({ error: 'Промпт обязателен' }, { status: 400 })
-    }
-
-    const sessionId = `aivideo-${Date.now()}`
+    const sessionId = `aiv-${Date.now()}`
     const totalDuration = duration || 5
     const numFrames = Math.min(10, Math.max(5, Math.ceil(totalDuration * 2)))
 
     const session: Session = {
-      id: sessionId,
-      status: 'generating',
-      framesDone: 0,
-      framesTotal: numFrames,
-      prompt,
-      duration: totalDuration,
+      id: sessionId, status: 'generating', framesDone: 0, framesTotal: numFrames,
+      prompt, duration: totalDuration,
     }
     sessions.set(sessionId, session)
 
-    // Start background generation
     generateInBackground(sessionId).catch((err) => {
       session.status = 'error'
       session.error = err instanceof Error ? err.message : 'Unknown error'
@@ -76,54 +69,72 @@ export async function GET(req: NextRequest) {
 
 async function generateInBackground(sessionId: string) {
   const session = sessions.get(sessionId)!
-  const zai = await ZAI.create()
   const uploadsDir = path.join(process.cwd(), 'public', 'uploads')
   await fs.promises.mkdir(uploadsDir, { recursive: true })
-  const framesDir = path.join(uploadsDir, `${sessionId}`)
+  const framesDir = path.join(uploadsDir, sessionId)
   await fs.promises.mkdir(framesDir, { recursive: true })
 
   const motionWords = [
-    'wide establishing shot', 'camera moves forward', 'continuing motion zoom',
-    'mid-point dynamic angle', 'closer view detail', 'camera pulls back',
-    'new perspective side angle', 'dramatic lighting', 'close-up detail',
-    'wide shot conclusion',
+    'wide establishing shot, beginning',
+    'camera slowly moves forward',
+    'continuing motion, slight zoom in',
+    'mid-point, dynamic angle change',
+    'closer view, detail emerging',
+    'camera pulls back slightly',
+    'new perspective, side angle view',
+    'dramatic lighting, approaching climax',
+    'close-up detail, dramatic moment',
+    'wide shot, conclusion, final frame',
   ]
 
   const framePaths: string[] = []
   for (let i = 0; i < session.framesTotal; i++) {
-    const framePrompt = `${session.prompt}, ${motionWords[i % motionWords.length]}, cinematic, high quality`
+    const motionHint = motionWords[i % motionWords.length]
+    const framePrompt = `${session.prompt}, ${motionHint}, cinematic, high quality, detailed`
+    const encodedPrompt = encodeURIComponent(framePrompt.slice(0, 200))
+    const seed = 1000 + i * 137
+    const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=576&seed=${seed}&nologo=true&model=flux`
+
     try {
-      const result = await zai.images.generations.create({ prompt: framePrompt, size: '1024x576' as any })
-      const imgData = result.data[0] as any
-      let imgBuffer: Buffer
-      if (imgData.base64) {
-        imgBuffer = Buffer.from(imgData.base64, 'base64')
-      } else if (imgData.url) {
-        const imgRes = await fetch(imgData.url)
-        imgBuffer = Buffer.from(new Uint8Array(await imgRes.arrayBuffer()))
-      } else {
-        throw new Error('No image data')
-      }
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const buf = Buffer.from(await res.arrayBuffer())
+      if (buf.length < 1000) throw new Error('Response too small')
+
       const framePath = path.join(framesDir, `frame_${String(i).padStart(3, '0')}.jpg`)
-      await fs.promises.writeFile(framePath, imgBuffer)
+      await fs.promises.writeFile(framePath, buf)
       framePaths.push(framePath)
       session.framesDone = i + 1
-      console.log(`[ai-video] ${sessionId} frame ${i + 1}/${session.framesTotal}`)
-      if (i < session.framesTotal - 1) await sleep(600)
+      console.log(`[ai-video] ${sessionId} frame ${i + 1}/${session.framesTotal} done`)
     } catch (err) {
-      console.warn(`[ai-video] frame ${i + 1} failed`)
-      if (framePaths.length >= 3) break
-      await sleep(2000)
+      console.warn(`[ai-video] frame ${i + 1} failed:`, err instanceof Error ? err.message : err)
+      // Retry once
+      try {
+        await sleep(3000)
+        const res = await fetch(url, { signal: AbortSignal.timeout(30000) })
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer())
+          if (buf.length > 1000) {
+            const framePath = path.join(framesDir, `frame_${String(i).padStart(3, '0')}.jpg`)
+            await fs.promises.writeFile(framePath, buf)
+            framePaths.push(framePath)
+            session.framesDone = i + 1
+          }
+        }
+      } catch {
+        // Skip this frame
+      }
     }
+    if (i < session.framesTotal - 1) await sleep(500)
   }
 
   if (framePaths.length < 2) {
     session.status = 'error'
-    session.error = 'Недостаточно кадров'
+    session.error = 'Недостаточно кадров. Попробуйте ещё раз.'
     return
   }
 
-  // Stitch
+  // Stitch with ffmpeg
   session.status = 'stitching'
   const outputPath = path.join(uploadsDir, `${sessionId}.mp4`)
   const escapeShell = (s: string) => `'${s.replace(/'/g, "'\\''")}'`
@@ -163,6 +174,5 @@ async function generateInBackground(sessionId: string) {
   session.videoUrl = `/uploads/${sessionId}.mp4`
   session.status = 'done'
   console.log(`[ai-video] ${sessionId} complete: ${session.videoUrl}`)
-
   setTimeout(() => sessions.delete(sessionId), 10 * 60 * 1000)
 }
