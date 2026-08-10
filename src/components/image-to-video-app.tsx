@@ -118,9 +118,9 @@ const VIDEO_FILTERS = [
 
 const BG_MUSIC = [
   { id: 'none', name: 'Без музыки' },
-  { id: 'ambient', name: 'Амбиент (спокойно)' },
-  { id: 'upbeat', name: 'Энергично' },
-  { id: 'cinematic', name: 'Кинематографично' },
+  { id: 'ambient', name: 'Амбиент', url: 'https://cdn.pixabay.com/audio/2022/03/15/audio_1a8d6c1b8f.mp3' },
+  { id: 'upbeat', name: 'Энергично', url: 'https://cdn.pixabay.com/audio/2022/10/25/audio_8a6f3c1b6f.mp3' },
+  { id: 'cinematic', name: 'Кинематографично', url: 'https://cdn.pixabay.com/audio/2023/01/15/audio_2b5d4c8a9e.mp3' },
 ]
 
 const VOICES = [
@@ -499,6 +499,56 @@ export default function ImageToVideoApp() {
     bgMusic: 'none',
   })
   const [stats, setStats] = useState({ total: 0, success: 0, fail: 0, totalSeconds: 0 })
+  const bgMusicRef = useRef<HTMLAudioElement | null>(null)
+  const voiceoverRef = useRef<HTMLAudioElement | null>(null)
+
+  // Play background music + voiceover simultaneously with video
+  const playAudioWithVideo = useCallback(async () => {
+    // Stop any existing audio
+    if (bgMusicRef.current) { bgMusicRef.current.pause(); bgMusicRef.current = null }
+    if (voiceoverRef.current) { voiceoverRef.current.pause(); voiceoverRef.current = null }
+
+    // Play background music
+    const music = BG_MUSIC.find(m => m.id === settings.bgMusic)
+    if (music?.url) {
+      bgMusicRef.current = new Audio(music.url)
+      bgMusicRef.current.volume = 0.3
+      bgMusicRef.current.loop = true
+      bgMusicRef.current.play().catch(() => {})
+    }
+
+    // Generate and play voiceover
+    if (settings.withAudio) {
+      const texts: string[] = settings.dialogueMode
+        ? settings.dialogue.filter(l => l.text.trim()).map(l => l.text.trim())
+        : (settings.voiceoverText.trim() ? [settings.voiceoverText.trim()] : [])
+
+      for (const text of texts) {
+        try {
+          const ttsRes = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, voice: 'tongtong' }),
+          })
+          if (ttsRes.ok) {
+            const ttsData = await ttsRes.json()
+            if (ttsData.audioUrl) {
+              const audio = new Audio(ttsData.audioUrl)
+              audio.volume = 0.8
+              voiceoverRef.current = audio
+              audio.play()
+              await new Promise(r => { audio.onended = r; audio.onerror = r })
+            }
+          }
+        } catch {
+          const u = new SpeechSynthesisUtterance(text)
+          u.lang = 'ru-RU'
+          window.speechSynthesis.speak(u)
+          await new Promise(r => setTimeout(r, text.length * 60))
+        }
+      }
+    }
+  }, [settings.bgMusic, settings.withAudio, settings.dialogueMode, settings.dialogue, settings.voiceoverText])
 
   const [stage, setStage] = useState<Stage>('idle')
   const [errorMsg, setErrorMsg] = useState<string>('')
@@ -1055,20 +1105,7 @@ export default function ImageToVideoApp() {
             const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
             setStats(newStats)
             localStorage.setItem('i2v_stats', JSON.stringify(newStats))
-            // Voiceover
-            if (settings.withAudio) {
-              try {
-                const texts: string[] = settings.dialogueMode
-                  ? settings.dialogue.filter(l => l.text.trim()).map(l => l.text.trim())
-                  : (settings.voiceoverText.trim() ? [settings.voiceoverText.trim()] : [])
-                for (const text of texts) {
-                  try {
-                    const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
-                    if (ttsRes.ok) { const td = await ttsRes.json(); if (td.audioUrl) { const a = new Audio(td.audioUrl); a.play(); await new Promise(r => { a.onended = r; a.onerror = r }) } }
-                  } catch { const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u) }
-                }
-              } catch {}
-            }
+            playAudioWithVideo()
             try { const thumb = await dataUrlToThumbnail(imageDataUrl, 320); const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(SVD)', imageUrl: thumb, videoUrl: videoObjectUrl, createdAt: Date.now(), thumb }; const next = [item, ...history].slice(0, 12); setHistory(next); persistHistory(next) } catch {}
             return
           }
@@ -1129,13 +1166,7 @@ export default function ImageToVideoApp() {
             const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
             setStats(newStats)
             localStorage.setItem('i2v_stats', JSON.stringify(newStats))
-            if (settings.withAudio) {
-              try {
-                const texts: string[] = settings.dialogueMode ? settings.dialogue.filter(l => l.text.trim()).map(l => l.text.trim()) : (settings.voiceoverText.trim() ? [settings.voiceoverText.trim()] : [])
-                for (const text of texts) { try { const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) }); if (ttsRes.ok) { const td = await ttsRes.json(); if (td.audioUrl) { const a = new Audio(td.audioUrl); a.play(); await new Promise(r => { a.onended = r; a.onerror = r }) } } } catch { const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u) } }
-              } catch {}
-            }
-            try { const thumb = await dataUrlToThumbnail(imageDataUrl, 320); const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(ZAI)', imageUrl: thumb, videoUrl: zaiVideoUrl, createdAt: Date.now(), thumb }; const next = [item, ...history].slice(0, 12); setHistory(next); persistHistory(next) } catch {}
+            playAudioWithVideo()
             return
           }
         }
