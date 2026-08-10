@@ -193,6 +193,111 @@ async function fetchJsonSafely(
 }
 
 /**
+ * Generate AI video ENTIRELY in the browser.
+ * Loads AI frames from Pollinations.ai → draws to Canvas → MediaRecorder → WebM.
+ * NO server requests needed (except Pollinations.ai which is a public API).
+ * This bypasses the preview gateway completely.
+ */
+async function generateAIVideoClientSide(
+  prompt: string,
+  duration: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Blob> {
+  const numFrames = Math.min(8, Math.max(4, Math.ceil(duration * 1.5)))
+  const W = 640
+  const H = 360
+  const fps = 25
+  const frameDuration = duration / numFrames
+
+  const motionWords = [
+    'wide shot', 'camera moves forward', 'zoom in', 'dynamic angle',
+    'closer view', 'camera pulls back', 'side angle', 'final frame',
+  ]
+
+  // Step 1: Load AI frames from Pollinations.ai directly in browser
+  const images: HTMLImageElement[] = []
+  for (let i = 0; i < numFrames; i++) {
+    const motionHint = motionWords[i % motionWords.length]
+    const framePrompt = `${prompt.slice(0, 150)}, ${motionHint}, cinematic`
+    const encoded = encodeURIComponent(framePrompt)
+    const seed = 1000 + i * 137
+    const imgUrl = `https://image.pollinations.ai/prompt/${encoded}?width=${W}&height=${H}&seed=${seed}&nologo=true&model=flux`
+
+    const img = new window.Image()
+    img.crossOrigin = 'anonymous'
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve()
+      img.onerror = () => reject(new Error(`Frame ${i + 1} failed`))
+      img.src = imgUrl
+    })
+    images.push(img)
+    onProgress?.(i + 1, numFrames)
+  }
+
+  // Step 2: Create canvas + MediaRecorder
+  const canvas = document.createElement('canvas')
+  canvas.width = W
+  canvas.height = H
+  const ctx = canvas.getContext('2d')!
+  const stream = canvas.captureStream(fps)
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+    ? 'video/webm;codecs=vp9'
+    : 'video/webm;codecs=vp8'
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2000000 })
+  const chunks: Blob[] = []
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
+
+  return new Promise((resolve, reject) => {
+    recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }))
+    recorder.onerror = () => reject(new Error('Recorder error'))
+    recorder.start()
+
+    // Step 3: Draw frames with smooth transitions
+    let currentFrame = 0
+    let frameProgress = 0
+    const totalFrames = numFrames * Math.round(frameDuration * fps)
+
+    function drawFrame() {
+      if (currentFrame >= numFrames) {
+        recorder.stop()
+        return
+      }
+
+      const img = images[currentFrame]
+      const progress = frameProgress / (frameDuration * fps)
+
+      // Draw with subtle zoom
+      const zoom = 1.0 + 0.05 * Math.sin(progress * Math.PI)
+      const drawW = W * zoom
+      const drawH = H * zoom
+      const x = (W - drawW) / 2
+      const y = (H - drawH) / 2
+
+      ctx.fillStyle = '#000'
+      ctx.fillRect(0, 0, W, H)
+      ctx.drawImage(img, x, y, drawW, drawH)
+
+      // Crossfade to next frame in last 20% of current frame
+      if (progress > 0.8 && currentFrame < numFrames - 1) {
+        const nextImg = images[currentFrame + 1]
+        ctx.globalAlpha = (progress - 0.8) / 0.2
+        ctx.drawImage(nextImg, x, y, drawW, drawH)
+        ctx.globalAlpha = 1
+      }
+
+      frameProgress++
+      if (frameProgress >= frameDuration * fps) {
+        currentFrame++
+        frameProgress = 0
+      }
+
+      requestAnimationFrame(drawFrame)
+    }
+    drawFrame()
+  })
+}
+
+/**
  * Generate a Ken Burns video entirely in the browser using Canvas + MediaRecorder.
  * No server request needed — works even when the gateway returns 502.
  * Creates a smooth zoom/pan animation from a static image.
@@ -907,97 +1012,69 @@ export default function ImageToVideoApp() {
     {
       setStage('polling')
       setPollCount(0)
-      toast.info('🎨 Генерирую AI-кадры через нейросеть...')
+      toast.info('🎨 Генерирую AI-кадры через нейросеть (в браузере)...')
 
       try {
-        // Use GET with SHORT prompt (max 200 chars) to avoid URL length limits
-        const shortPrompt = enhancedPrompt.slice(0, 200)
-        const encodedPrompt = encodeURIComponent(shortPrompt)
-        const aiVideoRes = await fetch(`/api/ai-video?prompt=${encodedPrompt}&duration=${settings.duration}`)
-        const aiVideoData = await aiVideoRes.json()
+        // 100% CLIENT-SIDE: no server requests, no gateway, no 502
+        // Loads AI frames from Pollinations.ai directly → Canvas → MediaRecorder
+        const videoBlob = await generateAIVideoClientSide(
+          enhancedPrompt,
+          settings.duration,
+          (done, total) => {
+            setPollCount(done)
+            toast.info(`AI-кадр ${done}/${total}...`)
+          },
+        )
+        const videoObjectUrl = URL.createObjectURL(videoBlob)
 
-        if (aiVideoRes.ok && aiVideoData.sessionId) {
-          // Poll for progress
-          let aiVideoUrl: string | null = null
-          for (let poll = 0; poll < 120; poll++) {
-            if (cancelRef.current) break
-            setPollCount(poll + 1)
-            await new Promise((r) => setTimeout(r, 5000))
+        setVideoUrl(videoObjectUrl)
+        setStage('success')
+        toast.success('AI видео готово! (нейросетевые кадры)')
 
-            try {
-              const pollRes = await fetch(`/api/ai-video?sessionId=${encodeURIComponent(aiVideoData.sessionId)}`)
-              if (pollRes.ok) {
-                const pollData = await pollRes.json()
-                if (pollData.status === 'done' && pollData.videoUrl) {
-                  aiVideoUrl = pollData.videoUrl
-                  break
-                }
-                if (pollData.status === 'error') {
-                  throw new Error(pollData.error || 'AI generation failed')
-                }
-                // Show progress
-                if (pollData.framesDone > 0) {
-                  setPollCount(pollData.framesDone)
-                  toast.info(`AI-кадр ${pollData.framesDone}/${pollData.framesTotal}...`)
-                }
-              }
-            } catch { /* tolerate */ }
-          }
+        // Update stats
+        const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
+        setStats(newStats)
+        localStorage.setItem('i2v_stats', JSON.stringify(newStats))
 
-          if (aiVideoUrl) {
-            setVideoUrl(aiVideoUrl)
-            setStage('success')
-            toast.success('AI видео готово! (10 нейросетевых кадров)')
-
-            // Update stats
-            const newStats = { ...stats, total: stats.total + 1, success: stats.success + 1, totalSeconds: stats.totalSeconds + settings.duration }
-            setStats(newStats)
-            localStorage.setItem('i2v_stats', JSON.stringify(newStats))
-
-            // Play voiceover
-            if (settings.withAudio) {
+        // Play voiceover
+        if (settings.withAudio) {
+          try {
+            const textsToSpeak: string[] = []
+            if (settings.dialogueMode) {
+              settings.dialogue.forEach((line) => { if (line.text.trim()) textsToSpeak.push(line.text.trim()) })
+            } else if (settings.voiceoverText.trim()) {
+              textsToSpeak.push(settings.voiceoverText.trim())
+            }
+            for (const text of textsToSpeak) {
               try {
-                toast.info('🔊 Создаю озвучку через ZAI TTS...')
-                const textsToSpeak: string[] = []
-                if (settings.dialogueMode) {
-                  settings.dialogue.forEach((line) => { if (line.text.trim()) textsToSpeak.push(line.text.trim()) })
-                } else if (settings.voiceoverText.trim()) {
-                  textsToSpeak.push(settings.voiceoverText.trim())
-                }
-                for (const text of textsToSpeak) {
-                  try {
-                    const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
-                    if (ttsRes.ok) {
-                      const ttsData = await ttsRes.json()
-                      if (ttsData.audioUrl) {
-                        const audio = new Audio(ttsData.audioUrl)
-                        audio.play()
-                        await new Promise((r) => { audio.onended = r; audio.onerror = r })
-                      }
-                    }
-                  } catch {
-                    const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u)
+                const ttsRes = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice: 'tongtong' }) })
+                if (ttsRes.ok) {
+                  const ttsData = await ttsRes.json()
+                  if (ttsData.audioUrl) {
+                    const audio = new Audio(ttsData.audioUrl)
+                    audio.play()
+                    await new Promise((r) => { audio.onended = r; audio.onerror = r })
                   }
                 }
-              } catch { /* ignore */ }
+              } catch {
+                const u = new SpeechSynthesisUtterance(text); u.lang = 'ru-RU'; window.speechSynthesis.speak(u)
+              }
             }
-
-            // Save history
-            try {
-              const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
-              const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(AI frames)', imageUrl: thumb, videoUrl: aiVideoUrl, createdAt: Date.now(), thumb }
-              const next = [item, ...history].slice(0, 12)
-              setHistory(next)
-              persistHistory(next)
-            } catch { /* ignore */ }
-            return
-          }
+          } catch { /* ignore */ }
         }
-        // AI video failed — fall through to ZAI video API
-        toast.info('AI-кадры не сработали. Пробую ZAI Video API...')
+
+        // Save history
+        try {
+          const thumb = await dataUrlToThumbnail(imageDataUrl, 320)
+          const item: HistoryItem = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: settings.prompt || '(AI)', imageUrl: thumb, videoUrl: videoObjectUrl, createdAt: Date.now(), thumb }
+          const next = [item, ...history].slice(0, 12)
+          setHistory(next)
+          persistHistory(next)
+        } catch { /* ignore */ }
+        return
       } catch (err) {
-        console.warn('[generate] AI video failed, trying ZAI video:', err)
-        toast.info('Пробую ZAI Video API...')
+        console.warn('[generate] client AI video failed:', err)
+        throw err
       }
     }
 
