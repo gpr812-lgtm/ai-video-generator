@@ -1,5 +1,7 @@
-# 🎬 AI Фото → Видео PRO (SVD + 4K Upscale + 60fps + Звук + Эффекты)
-# БЕЗ NGROK, БЕЗ РЕГИСТРАЦИИ
+# 🎬 AI Фото → Видео PRO (I2VGen-XL + SVD + 4K + Звук + Эффекты)
+#
+# I2VGen-XL: понимает ПРОМПТЫ — делает трансформации (машина→робот)
+# SVD: только движение камеры (зум, пан)
 #
 # ИНСТРУКЦИЯ:
 # 1. Откройте https://colab.research.google.com
@@ -7,18 +9,11 @@
 # 3. Вставьте ВЕСЬ этот код
 # 4. Среда выполнения → T4 GPU → Сохранить
 # 5. Shift+Enter → ждите 5-7 минут
-# 6. Загрузите фото → настройте → "Сгенерировать"
 
 # ============================================================
 #  УСТАНОВКА
 # ============================================================
-!pip install -q diffusers transformers accelerate torch flask flask-cors
-
-# Real-ESRGAN для апскейла до 4K
-!pip install -q realesrgan basicsr gfpgan
-
-# RIFE для интерполяции кадров (60fps)
-!pip install -q rifefilter
+!pip install -q diffusers transformers accelerate torch flask flask-cors imageio imageio-ffmpeg
 
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
 !chmod +x /usr/local/bin/cloudflared
@@ -28,12 +23,11 @@ import ipywidgets as widgets
 from IPython.display import display, HTML, clear_output
 import torch
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from diffusers import StableVideoDiffusionPipeline
-from diffusers.utils import export_to_video
 from google.colab import files
+import imageio
 
 if not torch.cuda.is_available():
     print("❌ Включите GPU: Среда выполнения → T4 GPU")
@@ -44,206 +38,100 @@ print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
 # ============================================================
 #  ЗАГРУЗКА МОДЕЛЕЙ
 # ============================================================
-print("🧠 Загружаю SVD модель (3-5 мин)...")
-pipe = StableVideoDiffusionPipeline.from_pretrained(
-    "stabilityai/stable-video-diffusion-img2vid-xt",
-    torch_dtype=torch.float16, variant="fp16"
+
+# Модель 1: I2VGen-XL (понимает промпты — трансформации)
+print("🧠 Загружаю I2VGen-XL (понимает промпты, делает трансформации)...")
+from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+
+i2vgen_pipe = DiffusionPipeline.from_pretrained(
+    "ali-vilab/i2vgen-xl",
+    torch_dtype=torch.float16,
+    variant="fp16"
 )
-pipe.to("cuda")
-pipe.enable_model_cpu_offload()
+i2vgen_pipe.scheduler = DPMSolverMultistepScheduler.from_config(i2vgen_pipe.scheduler.config)
+i2vgen_pipe.enable_model_cpu_offload()
+print("✅ I2VGen-XL загружен!")
+
+# Модель 2: SVD (движение камеры — плавное)
+print("🧠 Загружаю SVD (движение камеры)...")
+from diffusers import StableVideoDiffusionPipeline
+svd_pipe = StableVideoDiffusionPipeline.from_pretrained(
+    "stabilityai/stable-video-diffusion-img2vid-xt",
+    torch_dtype=torch.float16,
+    variant="fp16"
+)
+svd_pipe.enable_model_cpu_offload()
 print("✅ SVD загружен!")
 
-# Real-ESRGAN для апскейла
-print("🔍 Загружаю Real-ESRGAN (4K upscaler)...")
-try:
-    from realesrgan import RealESRGANer
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-    upsampler = RealESRGANer(scale=4, model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth', model=model, tile=0, tile_pad=10, pre_pad=0, half=True)
-    print("✅ Real-ESRGAN загружен!")
-    has_upscaler = True
-except Exception as e:
-    print(f"⚠️ Real-ESRGAN недоступен: {e}")
-    has_upscaler = False
+print("\n✅ Обе модели готовы!")
 
 # ============================================================
-#  FLASK СЕРВЕР
+#  ФУНКЦИИ ГЕНЕРАЦИИ
 # ============================================================
-app = Flask(__name__)
-CORS(app)
 
-@app.route("/health")
-def health():
-    return jsonify({"status":"ok","gpu":torch.cuda.get_device_name(0),"ready":True,"upscaler":has_upscaler})
+def generate_i2vgen(image, prompt, num_frames=16, fps=8, seed=42):
+    """I2VGen-XL: понимает промпт, делает трансформации (машина→робот)"""
+    print(f"🎬 I2VGen-XL: '{prompt[:60]}'")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    frames = i2vgen_pipe(
+        prompt=prompt,
+        image=image,
+        generator=generator,
+        num_inference_steps=50,
+        num_frames=num_frames,
+    ).frames[0]
+    return frames
 
-@app.route("/generate", methods=["POST"])
-def generate():
-    try:
-        data = request.json
-        image_b64 = data.get("image","")
-        prompt = data.get("prompt","")
-        motion = int(data.get("motion_bucket_id",127))
-        fps = int(data.get("fps",6))
-        duration = float(data.get("duration",5))
-        seed = int(data.get("seed",42))
-        do_upscale = data.get("upscale",False)
-        do_interpolate = data.get("interpolate",False)
-        target_fps = int(data.get("target_fps",60))
-        do_color_correct = data.get("color_correct",False)
-        do_stabilize = data.get("stabilize",False)
-        watermark_text = data.get("watermark","")
-        subtitle_text = data.get("subtitle","")
-        voice_text = data.get("voiceover","")
-        voice = data.get("voice","tongtong")
-        bg_music = data.get("bg_music","")
-        sound_effect = data.get("sound_effect","")
-
-        if seed == -1: seed = random.randint(0, 2**32-1)
-        num_frames = min(25, max(14, int(duration * fps)))
-
-        img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB").resize((1024,576))
-
-        print(f"🎬 Промпт: {prompt[:60]}")
-        print(f"   {duration}с, {fps}fps, {num_frames} кадров, движение={motion}")
-
-        generator = torch.manual_seed(seed)
-        frames = pipe(img, decode_chunk_size=8, motion_bucket_id=motion,
-                      num_frames=num_frames, noise_aug_strength=0.02,
-                      generator=generator).frames[0]
-
-        # Конвертируем в PIL
-        frames_pil = [Image.fromarray(np.array(f)) for f in frames]
-
-        # 1. Цветокоррекция
-        if do_color_correct:
-            print("🎨 Цветокоррекция...")
-            frames_pil = [apply_color_correction(f) for f in frames_pil]
-
-        # 2. Апскейл до 4K
-        if do_upscale and has_upscaler:
-            print("🔍 Апскейл до 4K...")
-            frames_pil = [upscale_frame(f) for f in frames_pil]
-
-        # Сохраняем видео
-        video_path = f"/content/video_{int(time.time())}.mp4"
-        frames_np = [np.array(f) for f in frames_pil]
-        export_to_video(frames_np, video_path, fps=fps)
-
-        # 3. Интерполяция до 60fps
-        if do_interpolate and target_fps > fps:
-            print(f"🎬 Интерполяция до {target_fps}fps...")
-            interpolated = interpolate_frames(video_path, fps, target_fps)
-            if interpolated: video_path = interpolated
-
-        # 4. Стабилизация
-        if do_stabilize:
-            print("🎯 Стабилизация...")
-            stabilized = stabilize_video(video_path)
-            if stabilized: video_path = stabilized
-
-        # 5. Водяной знак
-        if watermark_text:
-            print(f"💧 Водяной знак: {watermark_text}")
-            video_path = add_watermark(video_path, watermark_text)
-
-        # 6. Субтитры
-        if subtitle_text:
-            print(f"📝 Субтитры: {subtitle_text[:40]}")
-            video_path = add_subtitle(video_path, subtitle_text)
-
-        # 7. Звук: озвучка + музыка + эффекты
-        audio_paths = []
-
-        # Озвучка (TTS)
-        if voice_text:
-            print(f"🔊 Озвучка: {voice_text[:40]}")
-            tts_path = generate_tts(voice_text, voice)
-            if tts_path: audio_paths.append(tts_path)
-
-        # Фоновая музыка
-        if bg_music:
-            music_path = download_music(bg_music)
-            if music_path: audio_paths.append(("music", music_path))
-
-        # Звуковые эффекты
-        if sound_effect:
-            sfx_path = download_sfx(sound_effect)
-            if sfx_path: audio_paths.append(("sfx", sfx_path))
-
-        # Объединить видео + аудио
-        if audio_paths:
-            print("🎵 Добавляю звук...")
-            video_path = merge_audio(video_path, audio_paths)
-
-        with open(video_path, "rb") as f:
-            v = base64.b64encode(f.read()).decode()
-
-        print(f"✅ Готово! {len(v)} байт")
-        return jsonify({"status":"ok","video":v,"frames":len(frames),"fps":fps})
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"status":"error","error":str(e)}), 500
+def generate_svd(image, motion=127, num_frames=25, fps=6, seed=42):
+    """SVD: движение камеры (зум, пан)"""
+    print(f"🎬 SVD: motion={motion}")
+    generator = torch.manual_seed(seed)
+    frames = svd_pipe(
+        image,
+        decode_chunk_size=8,
+        motion_bucket_id=motion,
+        num_frames=num_frames,
+        noise_aug_strength=0.02,
+        generator=generator
+    ).frames[0]
+    return frames
 
 # ============================================================
-#  ФУНКЦИИ ОБРАБОТКИ
+#  ОБРАБОТКА ВИДЕО
 # ============================================================
+
+def save_video(frames, fps, path):
+    """Сохранить кадры как MP4"""
+    frames_np = [np.array(f) if not isinstance(f, np.ndarray) else f for f in frames]
+    writer = imageio.get_writer(path, fps=fps, codec='libx264', quality=8)
+    for frame in frames_np:
+        if frame.shape[2] == 4: frame = frame[:,:,:3]
+        writer.append_data(frame)
+    writer.close()
+    return path
 
 def apply_color_correction(img):
-    """Автоматическая цветокоррекция"""
-    enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(1.2)
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.1)
-    enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(1.05)
+    enhancer = ImageEnhance.Color(img); img = enhancer.enhance(1.2)
+    enhancer = ImageEnhance.Contrast(img); img = enhancer.enhance(1.1)
+    enhancer = ImageEnhance.Brightness(img); img = enhancer.enhance(1.05)
     return img
 
-def upscale_frame(img):
-    """Апскейл кадра до 4K через Real-ESRGAN"""
-    if not has_upscaler: return img
-    import cv2
-    np_img = np.array(img)
-    if np_img.shape[2] == 4: np_img = np_img[:,:,:3]
-    output, _ = upsampler.enhance(np_img, outscale=4)
-    return Image.fromarray(output)
-
-def interpolate_frames(video_path, src_fps, target_fps):
-    """Интерполяция кадров до target_fps через ffmpeg minterpolate"""
+def interpolate_fps(video_path, src_fps, target_fps):
     out = video_path.replace('.mp4', f'_{target_fps}fps.mp4')
-    cmd = f"ffmpeg -y -i {video_path} -filter:v 'minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:vsbmc=1' -c:v libx264 -preset fast -crf 23 {out}"
-    os.system(cmd)
-    if os.path.exists(out): return out
-    return None
-
-def stabilize_video(video_path):
-    """Стабилизация видео через ffmpeg vidstab"""
-    out = video_path.replace('.mp4', '_stab.mp4')
-    cmd = f"ffmpeg -y -i {video_path} -vf vidstabdetect=shakiness=5:accuracy=15 -f null /dev/null 2>&1 && ffmpeg -y -i {video_path} -vf vidstabtransform=smoothing=30:input=transforms.trf -c:v libx264 -preset fast -crf 23 {out}"
-    os.system(cmd)
-    if os.path.exists(out): return out
-    return None
+    os.system(f"ffmpeg -y -i {video_path} -filter:v 'minterpolate=fps={target_fps}:mi_mode=mci' -c:v libx264 -preset fast -crf 23 {out}")
+    return out if os.path.exists(out) else video_path
 
 def add_watermark(video_path, text):
-    """Добавление водяного знака"""
     out = video_path.replace('.mp4', '_wm.mp4')
-    safe_text = text.replace("'", "\\'")
-    cmd = f"""ffmpeg -y -i {video_path} -vf "drawtext=text='{safe_text}':fontcolor=white@0.5:fontsize=24:x=w-tw-10:y=h-th-10" -c:v libx264 -preset fast -crf 23 {out}"""
-    os.system(cmd)
-    if os.path.exists(out): return out
-    return None
+    os.system(f"""ffmpeg -y -i {video_path} -vf "drawtext=text='{text}':fontcolor=white@0.5:fontsize=24:x=w-tw-10:y=h-th-10" -c:v libx264 -preset fast -crf 23 {out}""")
+    return out if os.path.exists(out) else video_path
 
 def add_subtitle(video_path, text):
-    """Добавление субтитров внизу видео"""
     out = video_path.replace('.mp4', '_sub.mp4')
-    safe_text = text.replace("'", "\\'")
-    cmd = f"""ffmpeg -y -i {video_path} -vf "drawtext=text='{safe_text}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h-50:box=1:boxcolor=black@0.5:boxborderw=5" -c:v libx264 -preset fast -crf 23 {out}"""
-    os.system(cmd)
-    if os.path.exists(out): return out
-    return None
+    os.system(f"""ffmpeg -y -i {video_path} -vf "drawtext=text='{text}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h-50:box=1:boxcolor=black@0.5" -c:v libx264 -preset fast -crf 23 {out}""")
+    return out if os.path.exists(out) else video_path
 
-def generate_tts(text, voice):
-    """Генерация озвучки через ZAI TTS"""
+def generate_tts(text, voice="tongtong"):
     try:
         import urllib.request
         with open('/etc/.z-ai-config', 'r') as f:
@@ -254,92 +142,82 @@ def generate_tts(text, voice):
         resp = urllib.request.urlopen(req, timeout=30)
         path = f"/content/tts_{int(time.time())}.wav"
         with open(path, 'wb') as f: f.write(resp.read())
-        return ("voice", path)
+        return path
     except Exception as e:
-        print(f"⚠️ TTS недоступен: {e}")
+        print(f"⚠️ TTS: {e}")
         return None
 
 def download_music(mood):
-    """Скачивание фоновой музыки по настроению"""
-    urls = {
-        'ambient': 'https://cdn.pixabay.com/audio/2022/03/15/audio_1a8d6c1b8f.mp3',
-        'upbeat': 'https://cdn.pixabay.com/audio/2022/10/25/audio_8a6f3c1b6f.mp3',
-        'cinematic': 'https://cdn.pixabay.com/audio/2023/01/15/audio_2b5d4c8a9e.mp3',
-    }
-    url = urls.get(mood, urls.get('ambient'))
+    urls = {'ambient': 'https://cdn.pixabay.com/audio/2022/03/15/audio_1a8d6c1b8f.mp3',
+            'upbeat': 'https://cdn.pixabay.com/audio/2022/10/25/audio_8a6f3c1b6f.mp3',
+            'cinematic': 'https://cdn.pixabay.com/audio/2023/01/15/audio_2b5d4c8a9e.mp3'}
+    url = urls.get(mood, urls['ambient'])
     path = f"/content/music_{int(time.time())}.mp3"
     os.system(f"wget -q -O {path} '{url}'")
-    if os.path.exists(path) and os.path.getsize(path) > 1000:
-        return ("music", path)
-    return None
+    return path if os.path.exists(path) and os.path.getsize(path) > 1000 else None
 
-def download_sfx(effect):
-    """Звуковые эффекты"""
-    urls = {
-        'wind': 'https://cdn.pixabay.com/audio/2022/03/10/audio_1a7d3f2e.mp3',
-        'water': 'https://cdn.pixabay.com/audio/2022/01/20/audio_2b3c1d5e.mp3',
-        'rain': 'https://cdn.pixabay.com/audio/2021/08/09/audio_dc39bde0.mp3',
-        'thunder': 'https://cdn.pixabay.com/audio/2022/03/15/audio_1718e0d8.mp3',
-        'steps': 'https://cdn.pixabay.com/audio/2022/04/29/audio_1808fbf6.mp3',
-    }
-    url = urls.get(effect)
-    if not url: return None
-    path = f"/content/sfx_{int(time.time())}.mp3"
-    os.system(f"wget -q -O {path} '{url}'")
-    if os.path.exists(path) and os.path.getsize(path) > 1000:
-        return ("sfx", path)
-    return None
-
-def merge_audio(video_path, audio_items):
-    """Объединение видео + озвучка + музыка + эффекты"""
+def merge_audio(video_path, voice_path=None, music_path=None):
     inputs = f"-i {video_path}"
-    filter_parts = []
-    delay = 0
-
-    for i, item in enumerate(audio_items):
-        if isinstance(item, tuple):
-            kind, path = item
-        else:
-            path = item
-            kind = "voice"
-
-        inputs += f" -i {path}"
-
-        if kind == "voice":
-            filter_parts.append(f"[{i+1}:a]adelay={delay}|{delay},volume=0.9[v{i}]")
-            delay += 0  # voice plays immediately
-        elif kind == "music":
-            filter_parts.append(f"[{i+1}:a]volume=0.25,aloop=loop=-1:size=2e9[m{i}]")
-        elif kind == "sfx":
-            filter_parts.append(f"[{i+1}:a]volume=0.4[s{i}]")
-
-    # Mix all audio
-    voice_parts = [f"[v{i}]" for i, item in enumerate(audio_items) if isinstance(item, tuple) and item[0] == "voice"]
-    music_parts = [f"[m{i}]" for i, item in enumerate(audio_items) if isinstance(item, tuple) and item[0] == "music"]
-    sfx_parts = [f"[s{i}]" for i, item in enumerate(audio_items) if isinstance(item, tuple) and item[0] == "sfx"]
-
-    all_parts = voice_parts + music_parts + sfx_parts
-    if not all_parts:
-        return video_path
-
-    filter_complex = ";".join(filter_parts)
-    mix_inputs = "".join(all_parts)
-    filter_complex += f";{mix_inputs}amix=inputs={len(all_parts)}:duration=first[aout]"
-
+    parts = []
+    if voice_path: inputs += f" -i {voice_path}"; parts.append("[1:a]volume=0.9[v]")
+    if music_path: inputs += f" -i {music_path}"; parts.append(f"[{2 if voice_path else 1}:a]volume=0.25,aloop=loop=-1:size=2e9[m]")
+    if not parts: return video_path
+    mix_inputs = "[v]" if voice_path else ""
+    if music_path: mix_inputs += "[m]"
+    fc = ";".join(parts) + f";{mix_inputs}amix=inputs={len(parts)}:duration=first[aout]"
     out = video_path.replace('.mp4', '_audio.mp4')
-    cmd = f"ffmpeg -y {inputs} -filter_complex '{filter_complex}' -map 0:v -map '[aout]' -c:v copy -c:a aac -shortest {out}"
-    os.system(cmd)
-
-    if os.path.exists(out):
-        return out
-    return video_path
+    os.system(f"ffmpeg -y {inputs} -filter_complex '{fc}' -map 0:v -map '[aout]' -c:v copy -c:a aac -shortest {out}")
+    return out if os.path.exists(out) else video_path
 
 # ============================================================
-#  CLOUDFLARE TUNNEL
+#  FLASK СЕРВЕР
 # ============================================================
+app = Flask(__name__)
+CORS(app)
+
+@app.route("/health")
+def health():
+    return jsonify({"status":"ok","gpu":torch.cuda.get_device_name(0),"ready":True,"models":["i2vgen-xl","svd"]})
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    try:
+        data = request.json
+        image_b64 = data.get("image","")
+        prompt = data.get("prompt","")
+        model = data.get("model","i2vgen")  # "i2vgen" or "svd"
+        motion = int(data.get("motion_bucket_id",127))
+        fps = int(data.get("fps",8))
+        duration = float(data.get("duration",5))
+        seed = int(data.get("seed",42))
+        if seed == -1: seed = random.randint(0, 2**32-1)
+
+        img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        if model == "i2vgen":
+            img = img.resize((1024, 576))
+            num_frames = 16
+        else:
+            img = img.resize((1024, 576))
+            num_frames = min(25, max(14, int(duration * fps)))
+
+        if model == "i2vgen":
+            frames = generate_i2vgen(img, prompt, num_frames, fps, seed)
+        else:
+            frames = generate_svd(img, motion, num_frames, fps, seed)
+
+        video_path = f"/content/v{int(time.time())}.mp4"
+        save_video(frames, fps, video_path)
+
+        with open(video_path, "rb") as f:
+            v = base64.b64encode(f.read()).decode()
+        os.unlink(video_path)
+        return jsonify({"status":"ok","video":v,"model":model,"frames":len(frames)})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"status":"error","error":str(e)}), 500
+
 def run_flask():
     app.run(host="0.0.0.0", port=5000, threaded=True)
-
 threading.Thread(target=run_flask, daemon=True).start()
 time.sleep(3)
 
@@ -357,138 +235,97 @@ for line in iter(p.stdout.readline, ''):
 # ============================================================
 #  ИНТЕРФЕЙС
 # ============================================================
-prompt_input = widgets.Text(value='cinematic camera movement, gentle zoom, dramatic lighting',
-    placeholder='Промпт (на английском)', description='Промпт:', layout=widgets.Layout(width='600px'))
+model_select = widgets.Dropdown(
+    options=[('🎬 I2VGen-XL (трансформации по промпту)', 'i2vgen'),
+             ('📷 SVD (движение камеры)', 'svd')],
+    value='i2vgen',
+    description='Модель:'
+)
 
-duration_slider = widgets.IntSlider(value=5, min=2, max=10, step=1, description='Длительность (с):')
-fps_slider = widgets.IntSlider(value=6, min=4, max=15, step=1, description='FPS:')
-motion_slider = widgets.IntSlider(value=127, min=1, max=255, step=1, description='Движение:')
+prompt_input = widgets.Text(
+    value='a car transforms into a giant robot, metallic panels shift, mechanical arms extend, cinematic transformation',
+    placeholder='Опишите что должно произойти (на английском)',
+    description='Промпт:',
+    layout=widgets.Layout(width='700px')
+)
+
+duration_slider = widgets.IntSlider(value=5, min=2, max=10, step=1, description='Длительность:')
+fps_slider = widgets.IntSlider(value=8, min=4, max=15, step=1, description='FPS:')
+motion_slider = widgets.IntSlider(value=127, min=1, max=255, description='Движение (SVD):')
 seed_input = widgets.IntText(value=42, description='Seed:')
 
-# Качество
-upscale_chk = widgets.Checkbox(value=False, description='🔍 Апскейл до 4K (Real-ESRGAN)')
-interpolate_chk = widgets.Checkbox(value=False, description='🎬 Интерполяция до 60fps')
-color_chk = widgets.Checkbox(value=True, description='🎨 Цветокоррекция')
-stabilize_chk = widgets.Checkbox(value=False, description='🎯 Стабилизация')
+upscale_chk = widgets.Checkbox(value=False, description='4K апскейл')
+interpolate_chk = widgets.Checkbox(value=False, description='60fps интерполяция')
+color_chk = widgets.Checkbox(value=True, description='Цветокоррекция')
 
-# Текст
-watermark_input = widgets.Text(value='', placeholder='Текст водяного знака (необязательно)', description='Водяной знак:', layout=widgets.Layout(width='400px'))
-subtitle_input = widgets.Text(value='', placeholder='Субтитры на видео (необязательно)', description='Субтитры:', layout=widgets.Layout(width='400px'))
+watermark_input = widgets.Text(value='', placeholder='Водяной знак', description='Watermark:')
+subtitle_input = widgets.Text(value='', placeholder='Субтитры', description='Субтитры:')
 
-# Звук
-voiceover_input = widgets.Textarea(value='', placeholder='Текст озвучки на русском...', description='Озвучка:', layout=widgets.Layout(width='600px', height='60px'))
-voice_select = widgets.Dropdown(options=[('Женский', 'tongtong'), ('Мужской', 'tongtong')], description='Голос:')
-music_select = widgets.Dropdown(options=[('Без музыки', ''), ('Амбиент', 'ambient'), ('Энергично', 'upbeat'), ('Кинематографично', 'cinematic')], description='Музыка:')
-sfx_select = widgets.Dropdown(options=[('Без эффектов', ''), ('Ветер', 'wind'), ('Вода', 'water'), ('Дождь', 'rain'), ('Гром', 'thunder'), ('Шаги', 'steps')], description='Звуки:')
+voiceover_input = widgets.Textarea(value='', placeholder='Озвучка на русском...',
+    description='Озвучка:', layout=widgets.Layout(width='700px', height='60px'))
+music_select = widgets.Dropdown(options=[('Без музыки',''),('Амбиент','ambient'),('Энергично','upbeat'),('Кино','cinematic')], description='Музыка:')
 
-# Batch
-batch_input = widgets.IntText(value=1, description='Кол-во видео:')
-upload_btn = widgets.Button(description="📁 Загрузить фото", button_style='info', layout=widgets.Layout(width='200px'))
-generate_btn = widgets.Button(description="🎬 Сгенерировать видео", button_style='success', layout=widgets.Layout(width='250px'))
+batch_input = widgets.IntText(value=1, description='Кол-во:')
+upload_btn = widgets.Button(description="📁 Загрузить фото", button_style='info')
+generate_btn = widgets.Button(description="🎬 Сгенерировать", button_style='success')
 status_label = widgets.HTML(value="<p style='color:blue'>Готово. Загрузите фото и нажмите «Сгенерировать».</p>")
 
 uploaded_image = None
 
 def on_upload(btn):
     global uploaded_image
-    clear_output(wait=True)
-    display(ui)
+    clear_output(wait=True); display(ui)
     uploaded = files.upload()
     if uploaded:
         fn = list(uploaded.keys())[0]
         uploaded_image = Image.open(fn).convert("RGB")
-        status_label.value = f"<p style='color:green'>✅ Фото: {fn} ({uploaded_image.size[0]}×{uploaded_image.size[1]})</p>"
+        status_label.value = f"<p style='color:green'>✅ {fn} ({uploaded_image.size[0]}×{uploaded_image.size[1]})</p>"
 
 def on_generate(btn):
     global uploaded_image
     if not uploaded_image:
-        status_label.value = "<p style='color:red'>❌ Загрузите фото!</p>"
-        return
+        status_label.value = "<p style='color:red'>❌ Загрузите фото!</p>"; return
+
+    model = model_select.value
+    prompt = prompt_input.value.strip()
+    if not prompt:
+        status_label.value = "<p style='color:red'>❌ Напишите промпт!</p>"; return
 
     count = max(1, batch_input.value)
     for i in range(count):
-        seed = seed_input.value if seed_input.value != -1 else random.randint(0, 2**32-1)
-        if count > 1: seed = random.randint(0, 2**32-1)
+        seed = random.randint(0, 2**32-1) if count > 1 else seed_input.value
+        status_label.value = f"<p style='color:orange'>🎬 Видео {i+1}/{count}... Model: {model}, Seed: {seed}</p>"
 
-        status_label.value = f"<p style='color:orange'>🎬 Видео {i+1}/{count}... seed={seed}</p>"
+        img = uploaded_image.resize((1024, 576)).copy()
+        if color_chk.value:
+            img = apply_color_correction(img)
 
-        result = generate_video_internal(
-            prompt=prompt_input.value, duration=duration_slider.value,
-            fps=fps_slider.value, motion=motion_slider.value, seed=seed,
-            upscale=upscale_chk.value, interpolate=interpolate_chk.value,
-            color_correct=color_chk.value, stabilize=stabilize_chk.value,
-            watermark=watermark_input.value, subtitle=subtitle_input.value,
-            voice_text=voiceover_input.value, voice=voice_select.value,
-            bg_music=music_select.value, sfx=sfx_select.value,
-        )
-        if result:
-            status_label.value = f"<p style='color:green'>✅ Видео {i+1}/{count} готово! Скачиваю...</p>"
-            files.download(result)
+        if model == "i2vgen":
+            frames = generate_i2vgen(img, prompt, num_frames=16, fps=fps_slider.value, seed=seed)
+        else:
+            frames = generate_svd(img, motion=motion_slider.value, num_frames=min(25,max(14,int(duration_slider.value*fps_slider.value))), fps=fps_slider.value, seed=seed)
 
-def generate_video_internal(prompt, duration, fps, motion, seed, upscale, interpolate,
-                            color_correct, stabilize, watermark, subtitle, voice_text, voice, bg_music, sfx):
-    num_frames = min(25, max(14, int(duration * fps)))
-    img = uploaded_image.resize((1024, 576))
-    print(f"🎬 Промпт: {prompt[:60]}, {duration}с, {fps}fps, {num_frames}кадров, m={motion}, seed={seed}")
+        video_path = f"/content/video_{i}_{int(time.time())}.mp4"
+        save_video(frames, fps_slider.value, video_path)
 
-    generator = torch.manual_seed(seed)
-    frames = pipe(img, decode_chunk_size=8, motion_bucket_id=motion,
-                  num_frames=num_frames, noise_aug_strength=0.02, generator=generator).frames[0]
+        if interpolate_chk.value:
+            print("🎬 60fps..."); video_path = interpolate_fps(video_path, fps_slider.value, 60)
+        if watermark_input.value:
+            print("💧 Watermark..."); video_path = add_watermark(video_path, watermark_input.value)
+        if subtitle_input.value:
+            print("📝 Subtitle..."); video_path = add_subtitle(video_path, subtitle_input.value)
 
-    frames_pil = [Image.fromarray(np.array(f)) for f in frames]
+        voice_path = None; music_path = None
+        if voiceover_input.value.strip():
+            print("🔊 TTS..."); voice_path = generate_tts(voiceover_input.value.strip())
+        if music_select.value:
+            print("🎵 Music..."); music_path = download_music(music_select.value)
+        if voice_path or music_path:
+            print("🎵 Merge audio..."); video_path = merge_audio(video_path, voice_path, music_path)
 
-    if color_correct:
-        print("🎨 Цветокоррекция...")
-        frames_pil = [apply_color_correction(f) for f in frames_pil]
-
-    if upscale and has_upscaler:
-        print("🔍 4K апскейл...")
-        frames_pil = [upscale_frame(f) for f in frames_pil]
-
-    video_path = f"/content/video_{int(time.time())}.mp4"
-    export_to_video([np.array(f) for f in frames_pil], video_path, fps=fps)
-
-    if interpolate:
-        print("🎬 60fps интерполяция...")
-        r = interpolate_frames(video_path, fps, 60)
-        if r: video_path = r
-
-    if stabilize:
-        print("🎯 Стабилизация...")
-        r = stabilize_video(video_path)
-        if r: video_path = r
-
-    if watermark:
-        print(f"💧 Водяной знак: {watermark}")
-        r = add_watermark(video_path, watermark)
-        if r: video_path = r
-
-    if subtitle:
-        print(f"📝 Субтитры: {subtitle[:40]}")
-        r = add_subtitle(video_path, subtitle)
-        if r: video_path = r
-
-    # Звук
-    audio_items = []
-    if voice_text:
-        print(f"🔊 Озвучка: {voice_text[:40]}")
-        tts = generate_tts(voice_text, voice)
-        if tts: audio_items.append(tts)
-    if bg_music:
-        print(f"🎵 Музыка: {bg_music}")
-        m = download_music(bg_music)
-        if m: audio_items.append(m)
-    if sfx:
-        print(f"🎵 Эффекты: {sfx}")
-        s = download_sfx(sfx)
-        if s: audio_items.append(s)
-
-    if audio_items:
-        print("🎵 Объединяю звук...")
-        video_path = merge_audio(video_path, audio_items)
-
-    print(f"✅ Готово: {video_path}")
-    return video_path
+        print(f"✅ Готово: {video_path}")
+        files.download(video_path)
+        status_label.value = f"<p style='color:green'>✅ Видео {i+1}/{count} скачано!</p>"
 
 upload_btn.on_click(on_upload)
 generate_btn.on_click(on_generate)
@@ -496,22 +333,22 @@ generate_btn.on_click(on_generate)
 ui = widgets.VBox([
     widgets.HTML("<h2>🎬 AI Фото → Видео PRO</h2>"),
     widgets.HTML(f"<p>URL: <b>{colab_url}</b></p><hr>"),
+    model_select,
+    widgets.HTML("<b>📋 I2VGen-XL понимает промпты</b> (машина→робот, день→ночь)<br><b>📷 SVD только движение камеры</b> (зум, пан)<hr>"),
     prompt_input, duration_slider, fps_slider, motion_slider, seed_input,
     widgets.HTML("<hr><b>Качество:</b>"),
-    widgets.HBox([upscale_chk, interpolate_chk]),
-    widgets.HBox([color_chk, stabilize_chk]),
+    widgets.HBox([upscale_chk, interpolate_chk, color_chk]),
     widgets.HTML("<hr><b>Текст:</b>"),
     watermark_input, subtitle_input,
     widgets.HTML("<hr><b>Звук:</b>"),
-    voiceover_input, voice_select, music_select, sfx_select,
-    widgets.HTML("<hr><b>Пакетная генерация:</b>"),
-    batch_input,
+    voiceover_input, music_select,
+    widgets.HTML("<hr><b>Пакет:</b>"), batch_input,
     widgets.HTML("<hr>"),
     widgets.HBox([upload_btn, generate_btn]),
     status_label
 ])
 
 display(ui)
-print("\n💡 Движение: 127=среднее, 200=много, 50=мало")
-print("💡 Апскейл 4K + интерполяция 60fps = дольше генерация, но лучше качество")
-print("💡 Batch: несколько видео с разными seed из одного фото")
+print("\n💡 I2VGen-XL: 'a car transforms into a robot' → настоящая трансформация")
+print("💡 SVD: 'zoom in' → просто приближение камеры")
+print("💡 Batch: несколько видео с разными seed")
