@@ -878,6 +878,7 @@ export default function ImageToVideoApp() {
       setPollCount(0)
       toast.info('🎬 Генерирую настоящее AI видео через Colab (SVD)...')
       try {
+        // Send ALL settings to Colab
         const response = await fetch(`${colabUrl}/generate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -885,9 +886,12 @@ export default function ImageToVideoApp() {
             image: resizedDataUrl.split(',')[1],
             prompt: enhancedPrompt.slice(0, 500),
             motion_bucket_id: settings.quality === 'quality' ? 180 : 127,
-            fps: 6,
-            num_frames: 25,
+            fps: settings.fps === 60 ? 15 : 6,
+            duration: Math.min(settings.duration, 10),
+            num_frames: Math.min(25, Math.max(14, Math.round(Math.min(settings.duration, 10) * (settings.fps === 60 ? 15 : 6)))),
+            noise_aug_strength: 0.02,
             seed: 42,
+            decode_chunk_size: settings.quality === 'quality' ? 8 : 4,
           }),
         })
         if (response.ok) {

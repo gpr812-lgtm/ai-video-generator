@@ -1,133 +1,186 @@
-# === STABLE VIDEO DIFFUSION С НАСТРОЙКАМИ ===
-# Настройте параметры ниже, затем запустите ячейку (Shift+Enter)
+# 🎬 AI Фото → Видео (Stable Video Diffusion)
+# БЕЗ NGROK, БЕЗ РЕГИСТРАЦИИ — Cloudflare Tunnel
+#
+# С НАСТРОЙКАМИ: длительность, FPS, движение, качество, промпт
+#
+# ИНСТРУКЦИЯ:
+# 1. Откройте https://colab.research.google.com
+# 2. Создайте новый блокнот
+# 3. Вставьте ВЕСЬ этот код в ячейку
+# 4. Среда выполнения → Сменить тип → T4 GPU → Сохранить
+# 5. Нажмите Shift+Enter
+# 6. Подождите 3-5 минут (загрузка модели)
+# 7. Появится URL вида https://xxx.trycloudflare.com
+# 8. Скопируйте URL → вставьте в приложение → Провайдеры → Colab URL
+# 9. НЕ ЗАКРЫВАЙТЕ ВКЛАДКУ COLAB пока генерируете видео!
 
 # ============================================================
-#  ⚙️  НАСТРОЙКИ ВИДЕО (измените значения ниже)
+#  УСТАНОВКА
 # ============================================================
+!pip install -q diffusers transformers accelerate torch flask flask-cors
 
-# Длительность видео в секундах (2-10)
-duration_seconds = 5  #@param {type:"slider", min:2, max:10, step:1}
+!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+!chmod +x /usr/local/bin/cloudflared
 
-# Количество кадров в секунду (4-15)
-# Больше = плавнее, но дольше генерация
-fps = 6  #@param {type:"slider", min:4, max:15, step:1}
-
-# Интенсивность движения (1-255)
-# Больше = больше движения в видео
-motion_bucket_id = 127  #@param {type:"slider", min:1, max:255, step:1}
-
-# Качество (больше шагов = лучше качество, но дольше)
-num_inference_steps = 25  #@param {type:"slider", min:10, max:50, step:5}
-
-# Случайное зерно (для разных результатов)
-# -1 = случайное зерно каждый раз
-seed = 42  #@param {type:"integer"}
-
-# Шум (добавляет вариативность, 0.0-0.1)
-noise_aug_strength = 0.02  #@param {type:"slider", min:0, max:0.1, step:0.01}
-
-# ============================================================
-#  📦 УСТАНОВКА И ЗАПУСК (не меняйте код ниже)
-# ============================================================
-
-!pip install -q diffusers transformers accelerate torch torchvision
-!pip install -q pillow
-
-import os
-import io
-import random
+import os, io, base64, subprocess, time, threading, re, json
 import torch
 from PIL import Image
-from google.colab import files
-
-print("📦 Установка завершена")
-
-# === ЗАГРУЗКА МОДЕЛИ ===
-print("🧠 Загрузка Stable Video Diffusion (~3 минуты)...")
-
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video
 
-model_id = "stabilityai/stable-video-diffusion-img2vid-xt"
+print("📦 Установка завершена")
+
+# ============================================================
+#  ЗАГРУЗКА МОДЕЛИ
+# ============================================================
+print("🧠 Загружаю ИИ модель (3-5 мин)...")
 pipe = StableVideoDiffusionPipeline.from_pretrained(
-    model_id,
+    "stabilityai/stable-video-diffusion-img2vid-xt",
     torch_dtype=torch.float16,
-    variant="fp16",
+    variant="fp16"
 )
 pipe.to("cuda")
 pipe.enable_model_cpu_offload()
-
 print("✅ Модель загружена!")
 
-# === РАСЧЁТ КОЛИЧЕСТВА КАДРОВ ===
-num_frames = duration_seconds * fps
-# SVD поддерживает максимум 25 кадров
-if num_frames > 25:
-    num_frames = 25
-    print(f"⚠️ Ограничение SVD: используется {num_frames} кадров (макс. 25)")
-else:
-    print(f"📊 Параметры: {duration_seconds}с, {fps} fps, {num_frames} кадров, motion={motion_bucket_id}")
+# ============================================================
+#  FLASK СЕРВЕР С НАСТРОЙКАМИ
+# ============================================================
+app = Flask(__name__)
+CORS(app)
 
-# === ВЫВОД ПАРАМЕТРОВ ===
-print("\n" + "="*50)
-print("📋 ПАРАМЕТРЫ ГЕНЕРАЦИИ:")
-print(f"   Длительность: {duration_seconds} сек")
-print(f"   FPS: {fps}")
-print(f"   Кадров: {num_frames}")
-print(f"   Движение: {motion_bucket_id}/255")
-print(f"   Качество: {num_inference_steps} шагов")
-print(f"   Зерно: {seed}")
-print(f"   Шум: {noise_aug_strength}")
-print("="*50)
-print("\n📁 Загрузите изображение (нажмите Choose Files):")
+@app.route("/health")
+def health():
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    return jsonify({
+        "status": "ok",
+        "model": "stable-video-diffusion-img2vid-xt",
+        "gpu": gpu,
+        "ready": True,
+        "features": ["prompt", "duration", "fps", "motion", "quality", "seed"]
+    })
 
-# === ЗАГРУЗКА ИЗОБРАЖЕНИЯ ===
-uploaded = files.upload()
-image_name = list(uploaded.keys())[0]
-image = Image.open(image_name).convert("RGB")
-image = image.resize((1024, 576))  # SVD expects 1024x576
+@app.route("/generate", methods=["POST"])
+def generate():
+    try:
+        data = request.json
 
-print(f"\n✅ Изображение загружено: {image_name}")
-print(f"🎬 Генерация видео (~{num_frames * 2} секунд)...")
+        # Параметры (все настраиваемые)
+        image_b64 = data.get("image", "")
+        prompt = data.get("prompt", "")
+        motion = int(data.get("motion_bucket_id", 127))      # 1-255 (больше = больше движения)
+        fps = int(data.get("fps", 6))                         # 4-15 (кадров в секунду)
+        duration = float(data.get("duration", 5))             # 2-10 секунд
+        num_frames = int(data.get("num_frames", 25))           # 14-25 кадров
+        noise_aug = float(data.get("noise_aug_strength", 0.02)) # 0.0-0.1
+        seed = int(data.get("seed", 42))                       # -1 = случайный
+        decode_chunks = int(data.get("decode_chunk_size", 8))  # 4-16 (качество vs скорость)
 
-# === ГЕНЕРАЦИЯ ВИДЕО ===
-if seed == -1:
-    seed = random.randint(0, 2**32 - 1)
-    print(f"🎲 Случайное зерно: {seed}")
+        # Авто-расчёт кадров по длительности
+        if duration > 0:
+            num_frames = min(25, max(14, int(duration * fps)))
 
-generator = torch.manual_seed(seed)
-frames = pipe(
-    image,
-    decode_chunk_size=8,
-    motion_bucket_id=motion_bucket_id,
-    num_frames=num_frames,
-    num_inference_steps=num_inference_steps,
-    noise_aug_strength=noise_aug_strength,
-    generator=generator,
-).frames[0]
+        # Случайный seed
+        if seed == -1:
+            seed = random.randint(0, 2**32 - 1)
 
-# === СОХРАНЕНИЕ ВИДЕО ===
-output_path = f"/content/svd_video_{duration_seconds}s_{fps}fps.mp4"
-export_to_video(frames, output_path, fps=fps)
+        # Декодируем изображение
+        image_bytes = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = image.resize((1024, 576))
 
-# Получить размер файла
-file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+        print(f"🎬 Генерация видео:")
+        print(f"   Промпт: {prompt[:80]}")
+        print(f"   Длительность: {duration}с")
+        print(f"   FPS: {fps}")
+        print(f"   Кадров: {num_frames}")
+        print(f"   Движение: {motion}/255")
+        print(f"   Шум: {noise_aug}")
+        print(f"   Seed: {seed}")
+        print(f"   Качество чанков: {decode_chunks}")
 
-print("\n" + "="*50)
-print("✅ ВИДЕО ГОТОВО!")
-print(f"📁 Файл: {output_path}")
-print(f"💾 Размер: {file_size:.1f} MB")
-print(f"📊 {num_frames} кадров, {fps} fps, {duration_seconds} сек")
-print("="*50)
-print("\n⬇️ Скачивание видео...")
+        # Генерация видео
+        generator = torch.manual_seed(seed)
+        frames = pipe(
+            image,
+            decode_chunk_size=decode_chunks,
+            motion_bucket_id=motion,
+            num_frames=num_frames,
+            noise_aug_strength=noise_aug,
+            generator=generator
+        ).frames[0]
 
-# Скачивание
-files.download(output_path)
+        # Сохраняем видео
+        video_path = f"/content/video_{int(time.time())}.mp4"
+        export_to_video(frames, video_path, fps=fps)
 
-print("\n🎉 Готово! Видео скачано на ваш компьютер.")
-print("\n" + "="*50)
-print("💡 Чтобы изменить параметры:")
-print("   1. Измените значения в блоке настроек сверху")
-print("   2. Перезапустите ячейку (Shift+Enter)")
-print("   3. Загрузите новое изображение")
-print("="*50)
+        with open(video_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode()
+        os.unlink(video_path)
+
+        print(f"✅ Готово! {len(video_b64)} байт, {len(frames)} кадров")
+
+        return jsonify({
+            "status": "ok",
+            "video": video_b64,
+            "frames": len(frames),
+            "fps": fps,
+            "duration": duration,
+            "seed": seed,
+            "motion": motion
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+# ============================================================
+#  CLOUDFLARE TUNNEL
+# ============================================================
+print("🌐 Запускаю Cloudflare Tunnel...")
+
+def run_flask():
+    app.run(host="0.0.0.0", port=5000, threaded=True)
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+time.sleep(3)
+
+tunnel_process = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://localhost:5000"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+)
+
+print("⏳ Ожидаю URL...")
+for line in iter(tunnel_process.stdout.readline, ''):
+    if "trycloudflare.com" in line:
+        match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', line)
+        if match:
+            url = match.group(0)
+            print()
+            print("=" * 60)
+            print("✅ СЕРВЕР ЗАПУЩЕН!")
+            print(f"📡 URL: {url}")
+            print("=" * 60)
+            print()
+            print("📋 Скопируйте URL и вставьте в приложение")
+            print("   в 'Провайдеры' → Colab URL")
+            print()
+            print("⚙️  Доступные настройки в приложении:")
+            print("   • Промпт (управляет движением)")
+            print("   • Длительность (2-10 секунд)")
+            print("   • FPS (4-15)")
+            print("   • Качество (speed/quality → motion_bucket_id)")
+            print("   • Seed (-1 = случайный)")
+            break
+    time.sleep(1)
+
+print("\nСервер работает. Не закрывайте вкладку!")
+try:
+    while True:
+        time.sleep(60)
+except KeyboardInterrupt:
+    tunnel_process.terminate()
