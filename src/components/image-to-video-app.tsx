@@ -484,7 +484,7 @@ export default function ImageToVideoApp() {
 
   // Load Colab URL from localStorage on mount
   useEffect(() => {
-    const savedUrl = localStorage.getItem('colab_url')
+    const savedUrl = localStorage.getItem('colab_url') || (typeof window !== 'undefined' && (window as any).__COLAB_URL__) || ''
     if (savedUrl) {
       setColabUrl(savedUrl)
       // Check if it's still alive
@@ -872,7 +872,7 @@ export default function ImageToVideoApp() {
     let enhancedPrompt = settings.prompt
 
     // ===== 1. TRY COLAB FIRST (browser → Colab directly, no gateway) =====
-    const colabUrl = (typeof window !== 'undefined' && localStorage.getItem('colab_url')) || colabStatus?.url || ''
+    const colabUrl = (typeof window !== 'undefined' && (localStorage.getItem('colab_url') || (window as any).__COLAB_URL__)) || colabStatus?.url || ''
     if (colabUrl) {
       setStage('polling')
       setPollCount(0)
