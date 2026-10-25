@@ -13,7 +13,8 @@
 # ============================================================
 #  УСТАНОВКА
 # ============================================================
-!pip install -q diffusers transformers accelerate torch flask flask-cors imageio imageio-ffmpeg
+# Чистая переустановка библиотек без использования кэша для исправления конфликта импорта
+!pip install --no-cache-dir -q -U diffusers transformers accelerate torchao torch flask flask-cors imageio imageio-ffmpeg
 
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
 !chmod +x /usr/local/bin/cloudflared
